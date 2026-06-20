@@ -22,7 +22,11 @@ import csv
 import sys
 import json
 import time
+import threading
+import traceback
+import psutil
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse, unquote
 
@@ -193,6 +197,7 @@ def save_seen_channels(ids):
 
 DELAY_BETWEEN_CHANNELS = 4
 DELAY_BETWEEN_PAGES    = 2        # seconds between page loads in the crawler
+MAX_CONCURRENT_CREATORS = 3       # number of creators processed in parallel (increase to 5 for faster runs)
 ABOUT_PAGE_SETTLE_MS   = 5000
 PAGE_SETTLE_MS         = 3000     # ms to wait for JS to render on crawled pages
 PAGE_FETCH_TIMEOUT_S   = 20
@@ -480,6 +485,34 @@ def get_latest_upload(playlist_id):
     ts = resp["items"][0]["contentDetails"]["videoPublishedAt"]
     return datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
 
+
+def get_upload_cadence(playlist_id):
+    """Fetch the 3 most recent upload dates and return (latest_date, max_gap_days).
+
+    max_gap_days is the largest gap between any two consecutive uploads.
+    Returns (None, None) if fewer than 2 uploads found.
+    """
+    resp = youtube.playlistItems().list(
+        part="contentDetails", playlistId=playlist_id, maxResults=3
+    ).execute()
+    items = resp.get("items", [])
+    dates = []
+    for it in items:
+        ts = it["contentDetails"].get("videoPublishedAt")
+        if ts:
+            try:
+                dates.append(datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc))
+            except Exception:
+                pass
+    if not dates:
+        return None, None
+    latest = max(dates)
+    if len(dates) < 2:
+        return latest, None
+    dates_sorted = sorted(dates, reverse=True)
+    max_gap = max((dates_sorted[i] - dates_sorted[i+1]).days for i in range(len(dates_sorted)-1))
+    return latest, max_gap
+
 # ══════════════════════════════════════════════════════════════════════════════
 # FILTERS
 # ══════════════════════════════════════════════════════════════════════════════
@@ -523,6 +556,30 @@ def passes_personal_brand(title, desc):
     if corp >= 1 and fp == 0 and len(desc) > 100:
         return False
     return True
+
+
+_NO_FACE_SIGNALS = [
+    # channel structure signals
+    "animated", "animation", "cartoon", "illustrated", "faceless",
+    "avatar", "mascot", "character", "voiced by", "whiteboard",
+    # team / multi-person structure
+    " and ", " & ", "co-founder", "co-host", "our team", "team of",
+    "founded by", "created by a team",
+    # service / media brand (not a person)
+    "media", "studio", "productions", "publishing", "network", "channel",
+    "academy", "institute", "university", "school", "education",
+]
+
+def detect_no_face_signal(title, desc):
+    """Return a short reason string if the channel shows faceless/non-personal signals,
+    else return empty string.  Does NOT disqualify — used to route to Manual Review."""
+    tl = title.lower()
+    dl = (desc or "").lower()
+    combined = tl + " " + dl
+    hits = [s for s in _NO_FACE_SIGNALS if s in combined]
+    if not hits:
+        return ""
+    return "no-face signal: " + ", ".join(hits[:3])
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PLAYWRIGHT HELPERS
@@ -695,15 +752,54 @@ LEAD_MAGNET_KEYWORDS = [
 
 PRICE_RE = re.compile(r"[$£€]\s?(\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{2})?")
 
+_OFFER_PRICE_KEYWORDS = [
+    # purchase / enrollment actions
+    "join", "enroll", "enroll now", "sign up", "get access", "buy", "purchase",
+    "checkout", "add to cart", "order now", "get started",
+    # product / offer nouns
+    "program", "course", "coaching", "coach", "mentorship", "mentoring",
+    "membership", "community", "mastermind", "cohort", "workshop", "bootcamp",
+    "training", "curriculum", "module", "masterclass", "accelerator",
+    "package", "bundle", "service", "offer", "product", "digital", "ebook",
+    # pricing language
+    "price", "pricing", "cost", "investment", "tuition", "fee", "pay",
+    "payment", "installment", "payments of", "per month", "per year",
+    "one-time", "one time", "pay in full", "only $", "just $", "starting at",
+    "from $", "as low as", "valued at", "worth", "retail", "regular price",
+    "original price", "sale price", "special offer", "limited time",
+]
+_NON_OFFER_KEYWORDS = [
+    # testimonials / revenue / stats — these numbers are NOT prices
+    "made", "earned", "generated", "revenue", "income", "profit", "sales",
+    "in sales", "a month", "a day", "per day", "per week", "monthly",
+    "followers", "subscribers", "views", "calories", "pounds", "kg", "lbs",
+    "saving", "saved", "discount", "off", "refund", "bonus worth",
+    "valued over", "lost", "burned", "shed",
+]
+
 def extract_prices(text):
-    """Return list of plausible dollar/pound/euro prices found in text."""
+    """Return offer prices that appear near offer-related language.
+
+    Accuracy over coverage: a price that cannot be associated with an actual
+    offer noun/verb within ±80 characters is dropped entirely. This prevents
+    testimonial revenue figures, weight-loss numbers, and stat callouts from
+    being misread as creator offer prices.
+    """
     out = []
+    low = (text or "").lower()
     for m in PRICE_RE.finditer(text or ""):
         try:
             v = int(m.group(1).replace(",", ""))
         except ValueError:
             continue
-        if 1 <= v <= 100000:
+        if not (1 <= v <= 100_000):
+            continue
+        window = low[max(0, m.start() - 80): m.end() + 80]
+        # Reject if a non-offer context word appears (e.g. "made $5k", "lost 60 lbs")
+        if any(kw in window for kw in _NON_OFFER_KEYWORDS):
+            continue
+        # Accept only if an offer keyword is present in the window
+        if any(kw in window for kw in _OFFER_PRICE_KEYWORDS):
             out.append(v)
     return out
 
@@ -1646,15 +1742,19 @@ def run_stage1():
             if d["subs"] < MIN_SUBS:
                 counts["subs"] += 1
                 continue
-            latest = get_latest_upload(d["uploads"])
+            latest, max_gap_days = get_upload_cadence(d["uploads"])
             if not latest or latest < cutoff:
                 counts["inactive"] += 1
                 continue
+            d["last_upload"]   = latest.strftime("%Y-%m-%d")
+            d["max_gap_days"]  = max_gap_days  # None if only 1 upload found
             if not passes_personal_brand(d["title"], d["description"]):
                 counts["company"] += 1
                 print(f"  skip [company]      {d['title']}")
                 continue
-            print(f"  PASS                {d['title']} ({d['subs']:,} subs)")
+            d["no_face_signal"] = detect_no_face_signal(d["title"], d["description"])
+            print(f"  PASS                {d['title']} ({d['subs']:,} subs)"
+                  + (f" [⚠ {d['no_face_signal']}]" if d["no_face_signal"] else ""))
             surviving.append(d)
             time.sleep(0.3)
 
@@ -1707,6 +1807,11 @@ def run_stage1():
             print(f"\n  → {ch['title']}")
             links = extract_about_links(page, ch["about_url"], ch["title"])
             yt_email_btn = "Y" if check_yt_email_button(page, ch["url"]) else "N"
+            cadence_base = {
+                "Last Upload Date":        ch.get("last_upload", ""),
+                "Largest Upload Gap Days": ch.get("max_gap_days", ""),
+                "No-Face Signal":          ch.get("no_face_signal", ""),
+            }
             if links:
                 for lk in links:
                     rows.append({
@@ -1718,6 +1823,7 @@ def run_stage1():
                         "Destination URL": lk["url"],
                         "Page Type":       detect_page_type(lk["url"]),
                         "YT Email Button": yt_email_btn,
+                        **cadence_base,
                     })
             else:
                 rows.append({
@@ -1729,13 +1835,15 @@ def run_stage1():
                     "Destination URL": "",
                     "Page Type":       "",
                     "YT Email Button": yt_email_btn,
+                    **cadence_base,
                 })
             time.sleep(DELAY_BETWEEN_CHANNELS)
 
         browser.close()
 
     fields = ["Channel Name","Channel URL","Subscribers","Country",
-              "Link Label","Destination URL","Page Type","YT Email Button"]
+              "Link Label","Destination URL","Page Type","YT Email Button",
+              "Last Upload Date","Largest Upload Gap Days","No-Face Signal"]
     with open(STAGE1_CSV, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader(); w.writerows(rows)
@@ -2821,64 +2929,123 @@ def run_stage2(stage1_rows=None, extra_seeds=None):
                     by_creator[name]["seed_labels"][u] = "manual seed"
 
     all_page_rows = []
+    print_lock = threading.Lock()
+    creator_start_times = {}  # name → start time, for avg processing time metric
 
+    def _crawl_one_creator(name, info):
+        """Run in a thread. Owns its own playwright + browser + page."""
+        seeds     = info["seed_urls"]
+        t_start   = time.time()
+        creator_start_times[name] = t_start
+        with print_lock:
+            print(f"\n{'─'*60}")
+            print(f"  [START] {name}  ({len(seeds)} seed URL(s))")
+        pages = []
+        if not seeds:
+            pages.append({
+                "Channel Name":   name,
+                "Depth":          0,
+                "Source":         "About page",
+                "Page Type":      "(no links found)",
+                "URL":            info["channel_url"],
+                "Page Title":     "",
+                "Extracted Text": "",
+                "Outbound Links": 0,
+            })
+        else:
+            try:
+                with sync_playwright() as pw:
+                    browser = pw.chromium.launch(
+                        headless=False, slow_mo=100, executable_path=CHROME_PATH,
+                        args=["--disable-blink-features=AutomationControlled","--no-sandbox"],
+                    )
+                    ctx = browser.new_context(
+                        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                        locale="en-US", viewport={"width":1280,"height":900},
+                    )
+                    pw_page = ctx.new_page()
+                    pages = crawl_creator_funnel(name, seeds, pw_page)
+                    browser.close()
+            except Exception as exc:
+                with print_lock:
+                    print(f"  [ERROR] {name}: {exc}")
+                    traceback.print_exc()
+        elapsed = time.time() - t_start
+        mem_mb  = psutil.Process().memory_info().rss / 1024 / 1024
+        with print_lock:
+            print(f"  [DONE]  {name} — {len(pages)} page(s) in {elapsed:.0f}s  "
+                  f"(RAM {mem_mb:.0f} MB)")
+        return name, pages
+
+    # ── Parallel funnel crawl (no IG — IG is serial below) ───────────────────
+    creator_list = list(by_creator.items())
+    pages_by_creator = {}  # name → page rows (preserved order for IG phase)
+
+    t_parallel_start = time.time()
+    with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_CREATORS) as pool:
+        futures = {pool.submit(_crawl_one_creator, name, info): name
+                   for name, info in creator_list}
+        for fut in as_completed(futures):
+            try:
+                name, pages = fut.result()
+                pages_by_creator[name] = pages
+                all_page_rows.extend(pages)
+            except Exception as exc:
+                name = futures[fut]
+                with print_lock:
+                    print(f"  [FATAL] {name}: {exc}")
+
+    t_parallel_end   = time.time()
+    total_parallel   = t_parallel_end - t_parallel_start
+    n_creators       = len(creator_list)
+    avg_per_creator  = total_parallel / max(n_creators, 1)
+    creators_per_hr  = 3600 / max(avg_per_creator, 1)
+    mem_mb_final     = psutil.Process().memory_info().rss / 1024 / 1024
+    print(f"\n  ── Parallel crawl complete ──")
+    print(f"     Creators: {n_creators}  |  Concurrent slots: {MAX_CONCURRENT_CREATORS}")
+    print(f"     Wall time: {total_parallel/60:.1f} min  |  Avg per creator: {avg_per_creator:.0f}s")
+    print(f"     Throughput: ~{creators_per_hr:.1f} creators/hr")
+    print(f"     Peak RAM: {mem_mb_final:.0f} MB")
+
+    # ── Instagram-assisted discovery (serial — shares a login session) ────────
+    ig_meta_rows = []
+
+    # Use a single shared browser for the IG phase (login state must be shared)
     with sync_playwright() as p:
-        browser = p.chromium.launch(
+        ig_browser = p.chromium.launch(
             headless=False, slow_mo=100, executable_path=CHROME_PATH,
             args=["--disable-blink-features=AutomationControlled","--no-sandbox"],
         )
-        ctx = browser.new_context(
+        # We also need a pw_page for crawling IG-discovered funnels
+        ig_crawl_ctx  = ig_browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
             locale="en-US", viewport={"width":1280,"height":900},
         )
-        pw_page = ctx.new_page()
+        ig_crawl_page = ig_crawl_ctx.new_page()
 
-        # Instagram context is created lazily on first need and reused for the run.
         ig_state = {"ctx": None, "page": None, "status": "unused"}
-        ig_meta_rows = []   # per-creator IG discovery results → instagram_meta.csv
 
         def get_ig():
-            """Lazy IG login; reused across creators. Returns ig page or None."""
             if not ENABLE_INSTAGRAM:
                 return None
             if ig_state["status"] == "ok":
                 return ig_state["page"]
             if ig_state["status"] not in ("unused",):
-                return None   # already failed this run — don't hammer login
-            igctx, igpage, status = ensure_ig_context(browser)
+                return None
+            igctx, igpage, status = ensure_ig_context(ig_browser)
             ig_state.update(ctx=igctx, page=igpage, status=status)
             return igpage if status == "ok" else None
 
-        for name, info in by_creator.items():
+        for name, info in creator_list:
             seeds = info["seed_urls"]
-            print(f"\n{'─'*60}")
-            print(f"  {name}  ({len(seeds)} seed URL(s))")
+            pages = pages_by_creator.get(name, [])
 
-            if not seeds:
-                print(f"  (no About-page links found — skipping crawl)")
-                all_page_rows.append({
-                    "Channel Name":   name,
-                    "Depth":          0,
-                    "Source":         "About page",
-                    "Page Type":      "(no links found)",
-                    "URL":            info["channel_url"],
-                    "Page Title":     "",
-                    "Extracted Text": "",
-                    "Outbound Links": 0,
-                })
-
-            pages = crawl_creator_funnel(name, seeds, pw_page) if seeds else []
-            all_page_rows.extend(pages)
-            if seeds:
-                print(f"  Crawl complete: {len(pages)} page(s) visited")
-
-            # ── Instagram-assisted discovery (gated, secondary) ───────────────
             ig_record = {"Channel Name": name, "Instagram Used": "N",
                          "Profiles Visited": "", "Bio Links Found": "",
                          "Business Accounts Found": "", "Bio Emails": "", "Status": "not triggered"}
             need_ig, ig_seed = creator_needs_instagram(seeds, pages)
             if need_ig:
-                print(f"  → would be Needs-More-Data; attempting Instagram-assisted discovery")
+                print(f"  → {name}: would be Needs-More-Data; attempting IG-assisted discovery")
                 ig_page = get_ig()
                 if ig_page is None:
                     ig_record.update({"Instagram Used": "Y",
@@ -2896,22 +3063,19 @@ def run_stage2(stage1_rows=None, extra_seeds=None):
                     })
                     if disc["bio_links"]:
                         print(f"  [IG] {len(disc['bio_links'])} bio link(s) → crawling funnel")
-                        extra = crawl_creator_funnel(name, disc["bio_links"], pw_page)
-                        for p in extra:
-                            p["Source"] = "ig-assisted | " + p.get("Source", "")
+                        extra = crawl_creator_funnel(name, disc["bio_links"], ig_crawl_page)
+                        for pg in extra:
+                            pg["Source"] = "ig-assisted | " + pg.get("Source", "")
                         all_page_rows.extend(extra)
                         print(f"  [IG] funnel crawl added {len(extra)} page(s)")
                     else:
                         print(f"  [IG] no crawlable bio links ({disc['status']})")
             ig_meta_rows.append(ig_record)
 
-            time.sleep(DELAY_BETWEEN_CHANNELS)
-
-        # Close IG context if it was opened
         if ig_state["ctx"] is not None:
             try: ig_state["ctx"].close()
             except Exception: pass
-        browser.close()
+        ig_browser.close()
 
     fields = ["Channel Name","Depth","Source","Page Type","URL",
               "Page Title","Extracted Text","Outbound Links"]
@@ -2982,10 +3146,13 @@ def run_stage3(stage2_rows=None):
                 name = r["Channel Name"]
                 if name not in stage1_meta:
                     stage1_meta[name] = {
-                        "Channel URL": r["Channel URL"],
-                        "Subscribers": r.get("Subscribers",""),
-                        "Country":     r.get("Country",""),
-                        "YT Email Button": r.get("YT Email Button",""),
+                        "Channel URL":            r["Channel URL"],
+                        "Subscribers":            r.get("Subscribers",""),
+                        "Country":                r.get("Country",""),
+                        "YT Email Button":        r.get("YT Email Button",""),
+                        "Last Upload Date":       r.get("Last Upload Date",""),
+                        "Largest Upload Gap Days":r.get("Largest Upload Gap Days",""),
+                        "No-Face Signal":         r.get("No-Face Signal",""),
                     }
                 dest = r.get("Destination URL","")
                 if dest:
@@ -3076,7 +3243,15 @@ def run_stage3(stage2_rows=None):
         classification = classify_creator(name, rows)
         classification["Email"] = email_by_name.get(name, "")
         classification["Email Source"] = email_source_by_name.get(name, "")
-        classification["YT Email Button"] = stage1_meta.get(name, {}).get("YT Email Button", "")
+        s1 = stage1_meta.get(name, {})
+        classification["YT Email Button"]         = s1.get("YT Email Button", "")
+        classification["Last Upload Date"]        = s1.get("Last Upload Date", "")
+        last_gap_raw = s1.get("Largest Upload Gap Days", "")
+        last_gap = int(last_gap_raw) if str(last_gap_raw).isdigit() else None
+        classification["Largest Upload Gap Days"] = last_gap_raw
+        no_face_signal = s1.get("No-Face Signal", "")
+        classification["No-Face Signal"] = no_face_signal
+        slow_cadence = last_gap is not None and last_gap > 90
 
         # ── Instagram-assisted discovery fields ───────────────────────────────
         igm = ig_meta.get(name, {})
@@ -3102,6 +3277,22 @@ def run_stage3(stage2_rows=None):
             classification["Outreach Angle"] = (
                 "REVIEW_REQUIRED — Instagram verification wall hit during discovery; "
                 "could not retrieve bio funnel. " + ig_status)
+
+        # Cadence override: gap between recent uploads > 90 days → can't auto-approve
+        if slow_cadence and angle_bucket(classification.get("Outreach Angle","")) == "QUALIFIED":
+            orig = classification["Outreach Angle"]
+            classification["Outreach Angle"] = (
+                f"REVIEW_REQUIRED (slow cadence — {last_gap}d gap between recent uploads) — "
+                + orig
+            )
+
+        # No-face override: animated / faceless / team brand → needs human verification
+        if no_face_signal and angle_bucket(classification.get("Outreach Angle","")) == "QUALIFIED":
+            orig = classification["Outreach Angle"]
+            classification["Outreach Angle"] = (
+                f"REVIEW_REQUIRED (no personal brand detected — {no_face_signal}) — "
+                + orig
+            )
 
         captcha_pending = any(r.get("Page Type") == "CAPTCHA pending" for r in rows)
         classification.update({
@@ -3171,6 +3362,7 @@ def run_stage3(stage2_rows=None):
         "Instagram Business Accounts Found","Instagram Assisted Discovery",
         "Previous Classification","New Classification","Evidence Found Via Instagram",
         "Pages Crawled","YT Email Button",
+        "Last Upload Date","Largest Upload Gap Days","No-Face Signal",
     ]
     with open(STAGE3_CSV, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fields)
@@ -3507,19 +3699,45 @@ def _rating(row):
         letter = _rating_cap(letter, "B")
     return letter
 
+def _verified_price_str(row):
+    """Return a 'Current Offers: ...' line using prices confirmed by extract_prices().
+
+    Pulls from the funnel path (which records tier + price per step) and the
+    deepest layer field. Falls back to 'Pricing not confidently determined' if
+    no concrete price was attached to an offer by the extractor.
+    """
+    path  = row.get("Funnel Path","") or ""
+    layer = row.get("Deepest Monetization Layer","") or ""
+    # extract $NNN patterns that actually appear next to offer labels in path/layer
+    price_hits = re.findall(r"\$(\d[\d,]*)", path + " " + layer)
+    prices = []
+    for p in price_hits:
+        try:
+            v = int(p.replace(",",""))
+            if 1 <= v < 100_000 and v not in prices:
+                prices.append(v)
+        except ValueError:
+            pass
+    if not prices:
+        return "Pricing not confidently determined"
+    ot = row.get("Highest Offer Type Found","offer")
+    return "Current offer: " + " / ".join(f"${p:,}" for p in sorted(prices))
+
+
 def _approved_note(row):
     has_comm = (row.get("Community Present")=="Y"
                 or "community" in (row.get("Funnel Path","")+row.get("Deepest Monetization Layer","")).lower())
     has_lm   = row.get("Lead Magnet Present (Y/N)")=="Y"
     ot       = row.get("Highest Offer Type Found","")
     big_aud  = _subs_int(row.get("Subscribers")) >= 500_000
+    price_str = _verified_price_str(row)
     if has_comm:
-        return "Community + course, no coaching detected — proven buyers, no ascension model"
+        return f"Community + course, no coaching detected — proven buyers, no ascension model. {price_str}"
     if has_lm:
-        return f"Lead magnet funnels into {ot.lower()} offer, no HT backend found"
+        return f"Lead magnet funnels into {ot.lower()} offer, no HT backend found. {price_str}"
     if big_aud:
-        return "Large audience, low-ticket monetization only, no HT backend found"
-    return f"{ot} only, no HT backend found — proven buyers, no ascension model"
+        return f"Large audience, low-ticket monetization only, no HT backend found. {price_str}"
+    return f"{ot} only, no HT backend found — proven buyers, no ascension model. {price_str}"
 
 def _review_note(row):
     reasons = []
@@ -3555,6 +3773,8 @@ def _review_note(row):
     ot = row.get("Highest Offer Type Found","")
     if ot in ("Low Ticket","Mid Ticket") and bkt not in ("DISQUALIFIED",):
         reasons.insert(0, f"{ot} offer, no confirmed HT")
+    price_str = _verified_price_str(row)
+    reasons.append(price_str)
     return "; ".join(reasons)
 
 
@@ -3614,13 +3834,16 @@ def build_outreach_sheets(stage3_rows=None):
             continue
 
         common = {
-            "Channel Name":     row.get("Channel Name",""),
-            "Subscribers":      row.get("Subscribers",""),
-            "Email":            email,
-            "Email Source":     row.get("Email Source",""),
-            "Channel Link":     row.get("Channel URL",""),
-            "YT Email Button":  "Y" if yt_btn else "N",
-            "Outreach Angle":   row.get("Outreach Angle",""),
+            "Channel Name":          row.get("Channel Name",""),
+            "Subscribers":           row.get("Subscribers",""),
+            "Email":                 email,
+            "Email Source":          row.get("Email Source",""),
+            "Channel Link":          row.get("Channel URL",""),
+            "YT Email Button":       "Y" if yt_btn else "N",
+            "Outreach Angle":        row.get("Outreach Angle",""),
+            "Last Upload Date":        row.get("Last Upload Date",""),
+            "Largest Upload Gap Days": row.get("Largest Upload Gap Days",""),
+            "No-Face Signal":          row.get("No-Face Signal",""),
         }
 
         if _is_approved(row):
@@ -3671,7 +3894,8 @@ def build_outreach_sheets(stage3_rows=None):
     ap_fields = ["Channel Name","Subscribers","Email","Email Source","Channel Link",
                  "YT Email Button","Outreach Angle","Notes"]
     mr_fields = ["Channel Name","Subscribers","Email","Email Source","Channel Link",
-                 "YT Email Button","Confidence","Rating","Outreach Angle","Notes"]
+                 "YT Email Button","Confidence","Rating","Outreach Angle","Notes",
+                 "Last Upload Date","Largest Upload Gap Days","No-Face Signal"]
     dq_fields = ["Channel Name","Subscribers","Email","Email Source","Channel Link",
                  "HT Score","HT Level","Disqualification Reason","Evidence",
                  "Deepest Monetization Layer","Highest Offer Type Found",
