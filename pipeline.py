@@ -262,6 +262,57 @@ def channel_id_from_url(url):
     m = re.search(r"/channel/([A-Za-z0-9_\-]+)", url or "")
     return m.group(1) if m else ""
 
+def get_hidden_email(channel_url):
+    """Click the 'View email address' button on a YouTube About page via
+    undetected_chromedriver to bypass the reCAPTCHA gate that hides the email.
+    Returns the first non-Google/YouTube email found, or None."""
+    try:
+        import undetected_chromedriver as uc
+        from selenium.webdriver.common.by import By
+        from selenium.webdriver.support.ui import WebDriverWait
+        from selenium.webdriver.support import expected_conditions as EC
+    except ImportError:
+        return None
+
+    options = uc.ChromeOptions()
+    options.add_argument("--no-sandbox")
+    options.add_argument("--headless=new")
+    options.binary_location = CHROME_PATH
+
+    driver = None
+    try:
+        driver = uc.Chrome(options=options)
+        about_url = channel_url.rstrip("/") + "/about"
+        driver.get(about_url)
+        time.sleep(4)
+
+        try:
+            btn = WebDriverWait(driver, 6).until(
+                EC.element_to_be_clickable((
+                    By.XPATH,
+                    "//*[contains(text(),'View email address') "
+                    "or contains(@aria-label,'View email')]"
+                ))
+            )
+            btn.click()
+            time.sleep(2)
+        except Exception:
+            return None
+
+        page_text = driver.find_element(By.TAG_NAME, "body").text
+        emails = extract_emails(page_text)
+        return emails[0] if emails else None
+
+    except Exception as ex:
+        print(f"  [hidden-email] {ex}")
+        return None
+    finally:
+        if driver:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+
 # ══════════════════════════════════════════════════════════════════════════════
 # YOUTUBE API HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2722,6 +2773,20 @@ def run_stage3(stage2_rows=None):
         if es:
             email_by_name[name] = es[0]
 
+    # Hidden-email fallback: click YouTube's "View email address" button via
+    # undetected_chromedriver to bypass the reCAPTCHA gate on the About page.
+    for name, m in meta.items():
+        if name in email_by_name:
+            continue
+        ch_url = m.get("Channel URL", "")
+        if not ch_url:
+            continue
+        print(f"  [hidden-email] trying YouTube About page for {name} …")
+        e = get_hidden_email(ch_url)
+        if e:
+            print(f"  [hidden-email] found {e} for {name}")
+            email_by_name[name] = e
+
     out_rows = []
     for name, rows in by_creator.items():
         print(f"  Classifying: {name}")
@@ -3093,20 +3158,16 @@ def _subs_int(v):
     except (TypeError, ValueError): return 0
 
 def _is_approved(row):
-    """Strict gate. ALL conditions must hold, incl. an available email."""
-    # HT Level == "None" + the QUALIFIED bucket already encode the tier-based
-    # "no mature HT backend" verdict (price + sales structure). We deliberately do
-    # NOT re-gate on the loose legacy Coaching/Application booleans — a priced
-    # low-ticket "coaching" offer is a valid prospect, not a disqualifier.
+    """Strict gate. Email is NOT required — approved leads without one are still
+    routed to APPROVED so outreach can proceed once email is sourced manually."""
     return (
         angle_bucket(row.get("Outreach Angle","")) == "QUALIFIED"
         and row.get("Data Confidence")        == "High"
         and row.get("Endpoint Confidence")    == "High"
         and row.get("Endpoint Uncertain","N") == "N"
         and row.get("HT Level","None")        == "None"
-        and row.get("Captcha Pending","N")    == "N"   # unresolved CAPTCHA → can't fully verify
+        and row.get("Captcha Pending","N")    == "N"
         and row.get("Highest Offer Type Found","") in ("Low Ticket", "Mid Ticket")
-        and bool((row.get("Email","") or "").strip())
     )
 
 def _attractiveness(row):
