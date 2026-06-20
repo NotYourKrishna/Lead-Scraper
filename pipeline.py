@@ -1422,6 +1422,15 @@ def classify_creator(channel_name, rows):
     if mentorship_present:   mono.append("Mentorship")
     if application_present:  mono.append("Application Funnel")
 
+    # ── Offer fragmentation ──────────────────────────────────────────────────
+    # A creator with many scattered assets (several courses/ebooks/guides/free
+    # resources/communities + multiple price points sitting out in the open) is a
+    # prime "consolidation" target: the pitch is to roll their fragmented offers
+    # into ONE high-ticket service we'd build & run for them. Two independent
+    # signals — breadth of asset TYPES and number of distinct visible PRICES.
+    distinct_prices = sorted({p for p in extract_prices(page_texts) if p >= 50})
+    fragmented = (len(mono) >= 3) or (len(distinct_prices) >= 2)
+
     # ── Funnel maturity (only meaningful at Medium+ confidence) ─────────────
     if confidence == "Low" and not any_mono_signal:
         maturity = "Unknown — Insufficient data"
@@ -1475,10 +1484,21 @@ def classify_creator(channel_name, rows):
                  f"we cannot see past; HT backend NOT ruled out. Manual review required. "
                  f"Path so far: {fd['funnel_path']}")
     elif highest_tier in (TIER_LOW_TICKET, TIER_MID_TICKET):
-        angle = (f"QUALIFIED — funnel ends at {fd['highest_offer_type']} "
-                 f"({fd['deepest_layer']}), no HT backend found (endpoint conf "
-                 f"{ep['endpoint_confidence']}). Path: {fd['funnel_path']} "
-                 f"— pitch HT ascension offer")
+        if fragmented:
+            assets_str = ", ".join(mono[:5])
+            price_str  = ("/".join(f"${p}" for p in distinct_prices[:4])
+                          if distinct_prices else "")
+            angle = (f"QUALIFIED (consolidation play) — fragmented offers "
+                     f"[{assets_str}{('; prices ' + price_str) if price_str else ''}] "
+                     f"scattered with no single home; pitch consolidating them under one "
+                     f"roof — a high-ticket service you'd build & run for them. Deepest "
+                     f"layer {fd['deepest_layer']}, no HT backend (endpoint conf "
+                     f"{ep['endpoint_confidence']}). Path: {fd['funnel_path']}")
+        else:
+            angle = (f"QUALIFIED — funnel ends at {fd['highest_offer_type']} "
+                     f"({fd['deepest_layer']}), no HT backend found (endpoint conf "
+                     f"{ep['endpoint_confidence']}). Path: {fd['funnel_path']} "
+                     f"— pitch HT ascension offer")
     elif highest_tier == TIER_LEAD_MAGNET:
         if confidence == "Low":
             angle = "NEEDS MORE DATA — lead magnet found but funnel not fully reachable: " + suf["notes"]
@@ -1551,6 +1571,7 @@ def classify_creator(channel_name, rows):
         "Application Funnel Present": "Y" if application_present else "N",
         "HT Signals Found":           " | ".join(ht_signals_found) if ht_signals_found else "None",
         "Existing Monetization":      ", ".join(mono) if mono else "None confirmed",
+        "Offer Fragmentation":        "Y" if fragmented else "N",
         "Funnel Maturity":            maturity,
         "Monetization Gaps":          " | ".join(gaps) if gaps else "None identified",
         "Outreach Angle":             angle,
@@ -2040,6 +2061,56 @@ def get_base_domain(url):
         return host
     except Exception:
         return ""
+
+def _norm_domain(host):
+    """Lowercase host with a leading 'www.' removed (prefix-safe, unlike lstrip)."""
+    host = (host or "").lower().strip()
+    return host[4:] if host.startswith("www.") else host
+
+def _domain_matches(dom, domain_set):
+    """True if dom equals or is a subdomain of any domain in domain_set."""
+    return any(dom == d or dom.endswith("." + d) for d in domain_set if d)
+
+def own_domains_from_urls(urls):
+    """Brand domains the creator actually controls — base domains of their
+    Stage-1 About-page links, excluding social and known platform/funnel hosts.
+    Derived from the creator's OWN declared links (not crawl- or IG-discovered
+    pages), so a third-party agency/platform the funnel merely links out to —
+    e.g. marquis.fr reached via an Instagram bio — never counts as 'theirs'.
+    Used to keep the page-text email fallback from harvesting third-party addresses."""
+    skip = SOCIAL_SKIP_DOMAINS | FUNNEL_FOLLOW_DOMAINS
+    out = set()
+    for u in urls:
+        dom = _norm_domain(urlparse(u or "").netloc)
+        if dom and not _domain_matches(dom, skip):
+            out.add(dom)
+    return out
+
+def pick_page_text_email(rows, own_domains):
+    """Choose a contact email from crawled page text — but ONLY if it plausibly
+    belongs to the creator, not a third-party agency/platform the funnel links out
+    to. Returns (email, source); ('','') when nothing trustworthy is found.
+
+    Priority:
+      1. email whose domain IS one of the creator's own brand domains
+      2. any email found ON one of the creator's own brand pages (e.g. a gmail
+         the creator lists on their own site)
+    Emails appearing only on third-party pages (the marquis.fr case) are dropped."""
+    strong = listed = ""
+    for r in rows:
+        page_dom    = _norm_domain(urlparse(r.get("URL", "") or "").netloc)
+        page_is_own = _domain_matches(page_dom, own_domains)
+        for e in extract_emails(r.get("Extracted Text", "")):
+            edom = _norm_domain(e.split("@")[-1]) if "@" in e else ""
+            if own_domains and _domain_matches(edom, own_domains):
+                strong = strong or e
+            elif page_is_own:
+                listed = listed or e
+    if strong:
+        return strong, "own-domain email"
+    if listed:
+        return listed, "listed on own site"
+    return "", ""
 
 def is_followable(url, creator_domains, visited):
     """
@@ -2897,7 +2968,9 @@ def run_stage3(stage2_rows=None):
     # Load Stage 1 for channel metadata (URL, subs, country) since Stage 2
     # rows are crawled pages and may not carry all creator metadata.
     stage1_meta = {}
-    email_by_name = {}   # best contact email per creator
+    email_by_name = {}        # best contact email per creator
+    email_source_by_name = {} # provenance of that email (trust signal for review)
+    seed_urls_by_name = defaultdict(list)  # creator's own declared About-page links
     try:
         with open(STAGE1_CSV, newline="", encoding="utf-8") as f:
             for r in csv.DictReader(f):
@@ -2909,9 +2982,15 @@ def run_stage3(stage2_rows=None):
                         "Country":     r.get("Country",""),
                         "YT Email Button": r.get("YT Email Button",""),
                     }
-                # Some About-page "links" are actually email addresses
-                for e in extract_emails(r.get("Destination URL","")):
-                    email_by_name.setdefault(name, e)
+                dest = r.get("Destination URL","")
+                if dest:
+                    seed_urls_by_name[name].append(dest)
+                # Some About-page "links" are actually email addresses — these are
+                # on the creator's own channel, so they're trusted as-is.
+                for e in extract_emails(dest):
+                    if name not in email_by_name:
+                        email_by_name[name] = e
+                        email_source_by_name[name] = "About-page bio link"
     except FileNotFoundError:
         pass
 
@@ -2954,25 +3033,31 @@ def run_stage3(stage2_rows=None):
             for cid, n in chunk:
                 if n in email_by_name:
                     continue
+                # YouTube channel description is the creator's own — trusted.
                 es = extract_emails(desc_by_id.get(cid, ""))
                 if es:
                     email_by_name[n] = es[0]
+                    email_source_by_name[n] = "YouTube description"
         except Exception as ex:
             print(f"  [email] description lookup failed: {ex}")
-    # Page-text fallback for anyone still without an email
+    # Page-text fallback — restricted to the creator's OWN brand domains so we
+    # don't grab a third-party agency/platform email the funnel merely links to
+    # (e.g. CONTACT@MARQUIS.FR off marquis.fr). No trustworthy email → stay empty.
     for name, rows in by_creator.items():
         if name in email_by_name:
             continue
-        blob = " ".join(r.get("Extracted Text", "") for r in rows)
-        es = extract_emails(blob)
-        if es:
-            email_by_name[name] = es[0]
+        own = own_domains_from_urls(seed_urls_by_name.get(name, []))
+        email, src = pick_page_text_email(rows, own)
+        if email:
+            email_by_name[name] = email
+            email_source_by_name[name] = src
 
     out_rows = []
     for name, rows in by_creator.items():
         print(f"  Classifying: {name}")
         classification = classify_creator(name, rows)
         classification["Email"] = email_by_name.get(name, "")
+        classification["Email Source"] = email_source_by_name.get(name, "")
         classification["YT Email Button"] = stage1_meta.get(name, {}).get("YT Email Button", "")
 
         # ── Instagram-assisted discovery fields ───────────────────────────────
@@ -3050,7 +3135,7 @@ def run_stage3(stage2_rows=None):
         print()
 
     fields = [
-        "Channel Name","Channel URL","Subscribers","Country","Email",
+        "Channel Name","Channel URL","Subscribers","Country","Email","Email Source",
         "Data Confidence","Data Sufficiency Notes","Nav Explored",
         "Pages Visited","Max Depth Reached","Pages Fetched OK",
         "Monetization Conclusion",
@@ -3061,7 +3146,8 @@ def run_stage3(stage2_rows=None):
         "Coaching Present","Mentorship Present","Community Present",
         "Course Present","Newsletter Present","Lead Magnet Present",
         "Book A Call Present","Application Funnel Present",
-        "HT Signals Found","Existing Monetization","Funnel Maturity",
+        "HT Signals Found","Existing Monetization","Offer Fragmentation",
+        "Funnel Maturity",
         "Monetization Gaps","Outreach Angle","Captcha Pending",
         "Instagram Used","Instagram Profiles Visited","Instagram Bio Links Found",
         "Instagram Business Accounts Found","Instagram Assisted Discovery",
@@ -3496,6 +3582,7 @@ def build_outreach_sheets(stage3_rows=None):
                 "Channel Name":              row.get("Channel Name",""),
                 "Subscribers":               row.get("Subscribers",""),
                 "Email":                     email,
+                "Email Source":              row.get("Email Source",""),
                 "Channel Link":              row.get("Channel URL",""),
                 "HT Score":                  row.get("HT Score",""),
                 "HT Level":                  row.get("HT Level",""),
@@ -3512,6 +3599,7 @@ def build_outreach_sheets(stage3_rows=None):
             "Channel Name":     row.get("Channel Name",""),
             "Subscribers":      row.get("Subscribers",""),
             "Email":            email,
+            "Email Source":     row.get("Email Source",""),
             "Channel Link":     row.get("Channel URL",""),
             "YT Email Button":  "Y" if yt_btn else "N",
             "Outreach Angle":   row.get("Outreach Angle",""),
@@ -3562,11 +3650,11 @@ def build_outreach_sheets(stage3_rows=None):
             w.writeheader(); w.writerows(data)
         return target
 
-    ap_fields = ["Channel Name","Subscribers","Email","Channel Link",
+    ap_fields = ["Channel Name","Subscribers","Email","Email Source","Channel Link",
                  "YT Email Button","Outreach Angle","Notes"]
-    mr_fields = ["Channel Name","Subscribers","Email","Channel Link",
+    mr_fields = ["Channel Name","Subscribers","Email","Email Source","Channel Link",
                  "YT Email Button","Confidence","Rating","Outreach Angle","Notes"]
-    dq_fields = ["Channel Name","Subscribers","Email","Channel Link",
+    dq_fields = ["Channel Name","Subscribers","Email","Email Source","Channel Link",
                  "HT Score","HT Level","Disqualification Reason","Evidence",
                  "Deepest Monetization Layer","Highest Offer Type Found",
                  "Confidence","YT Email Button"]
