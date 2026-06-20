@@ -2009,7 +2009,7 @@ def discover_via_instagram(ig_page, seed_ig_url, creator_name):
     Respects MAX_IG_PROFILES_PER_CREATOR and never exceeds it.
     """
     out = {"used": True, "profiles_visited": [], "bio_links": [],
-           "biz_accounts": [], "status": "ok"}
+           "biz_accounts": [], "bio_emails": [], "status": "ok"}
     creator_handle = ig_handle_from_url(seed_ig_url)
     if not creator_handle:
         out["status"] = "no IG handle in seed"
@@ -2036,6 +2036,10 @@ def discover_via_instagram(ig_page, seed_ig_url, creator_name):
         for bl in prof["bio_links"]:
             if bl not in out["bio_links"]:
                 out["bio_links"].append(bl)
+        # Emails in the creator's own IG bio text are trusted contact info
+        for em in extract_emails(prof.get("bio_text", "")):
+            if em not in out["bio_emails"]:
+                out["bio_emails"].append(em)
         # Queue tagged business accounts (respecting the profile cap)
         for biz in prof["biz_accounts"]:
             if biz not in out["biz_accounts"]:
@@ -2871,7 +2875,7 @@ def run_stage2(stage1_rows=None, extra_seeds=None):
             # ── Instagram-assisted discovery (gated, secondary) ───────────────
             ig_record = {"Channel Name": name, "Instagram Used": "N",
                          "Profiles Visited": "", "Bio Links Found": "",
-                         "Business Accounts Found": "", "Status": "not triggered"}
+                         "Business Accounts Found": "", "Bio Emails": "", "Status": "not triggered"}
             need_ig, ig_seed = creator_needs_instagram(seeds, pages)
             if need_ig:
                 print(f"  → would be Needs-More-Data; attempting Instagram-assisted discovery")
@@ -2887,6 +2891,7 @@ def run_stage2(stage1_rows=None, extra_seeds=None):
                         "Profiles Visited": ", ".join("@" + p for p in disc["profiles_visited"]),
                         "Bio Links Found": " | ".join(disc["bio_links"]),
                         "Business Accounts Found": ", ".join("@" + b for b in disc["biz_accounts"]),
+                        "Bio Emails": " | ".join(disc["bio_emails"]),
                         "Status": disc["status"],
                     })
                     if disc["bio_links"]:
@@ -2916,7 +2921,7 @@ def run_stage2(stage1_rows=None, extra_seeds=None):
 
     # Persist per-creator IG discovery metadata for Stage 3
     ig_fields = ["Channel Name","Instagram Used","Profiles Visited",
-                 "Bio Links Found","Business Accounts Found","Status"]
+                 "Bio Links Found","Business Accounts Found","Bio Emails","Status"]
     with open(INSTAGRAM_META_CSV, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=ig_fields)
         w.writeheader(); w.writerows(ig_meta_rows)
@@ -3040,6 +3045,19 @@ def run_stage3(stage2_rows=None):
                     email_source_by_name[n] = "YouTube description"
         except Exception as ex:
             print(f"  [email] description lookup failed: {ex}")
+    # Instagram bio emails — the creator's own IG bio is their voice; any email
+    # written there is a genuine contact address (booking, management, etc.).
+    for name, igm in ig_meta.items():
+        if name in email_by_name:
+            continue
+        bio_emails_raw = igm.get("Bio Emails", "") or ""
+        for e in bio_emails_raw.split(" | "):
+            e = e.strip()
+            if e:
+                email_by_name[name] = e
+                email_source_by_name[name] = "Instagram bio"
+                break
+
     # Page-text fallback — restricted to the creator's OWN brand domains so we
     # don't grab a third-party agency/platform email the funnel merely links to
     # (e.g. CONTACT@MARQUIS.FR off marquis.fr). No trustworthy email → stay empty.
