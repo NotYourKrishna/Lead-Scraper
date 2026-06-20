@@ -1,0 +1,31 @@
+# Credentials & sessions — never commit these
+.env
+ig_credentials.json
+ig_session.json
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Claude internal
+.claude/
+
+# Intermediate pipeline CSVs (large, regenerable)
+stage2_pages.csv
+stage2_pages_v2.csv
+stage3_profiles.csv
+stage3_profiles_v2.csv
+stage3_profiles_v3.csv
+stage3_profiles_v4.csv
+stage3_profiles_v5.csv
+stage3_profiles_v6.csv
+
+# Old versioned lead files
+leads_dropshipping_test.csv
+leads_dropshipping_v2.csv
+leads_dropshipping_v3.csv
+leads_dropshipping_v4.csv
+
+# Backup CSVs
+*.new.csv
