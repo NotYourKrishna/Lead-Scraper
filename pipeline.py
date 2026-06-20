@@ -487,31 +487,49 @@ def get_latest_upload(playlist_id):
 
 
 def get_upload_cadence(playlist_id):
-    """Fetch the 3 most recent upload dates and return (latest_date, max_gap_days).
+    """Fetch the 3 most recent upload dates and return (latest_date, max_gap_days, latest_video_id).
 
     max_gap_days is the largest gap between any two consecutive uploads.
-    Returns (None, None) if fewer than 2 uploads found.
+    Returns (None, None, None) if no uploads found.
     """
     resp = youtube.playlistItems().list(
         part="contentDetails", playlistId=playlist_id, maxResults=3
     ).execute()
     items = resp.get("items", [])
     dates = []
-    for it in items:
+    latest_video_id = None
+    for i, it in enumerate(items):
         ts = it["contentDetails"].get("videoPublishedAt")
+        vid = it["contentDetails"].get("videoId")
         if ts:
             try:
                 dates.append(datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc))
+                if i == 0:
+                    latest_video_id = vid
             except Exception:
                 pass
     if not dates:
-        return None, None
+        return None, None, None
     latest = max(dates)
     if len(dates) < 2:
-        return latest, None
+        return latest, None, latest_video_id
     dates_sorted = sorted(dates, reverse=True)
     max_gap = max((dates_sorted[i] - dates_sorted[i+1]).days for i in range(len(dates_sorted)-1))
-    return latest, max_gap
+    return latest, max_gap, latest_video_id
+
+
+def get_latest_video_description(video_id):
+    """Return the description of a specific video, or '' on failure."""
+    if not video_id:
+        return ""
+    try:
+        resp = youtube.videos().list(part="snippet", id=video_id).execute()
+        items = resp.get("items", [])
+        if items:
+            return items[0]["snippet"].get("description", "")
+    except Exception:
+        pass
+    return ""
 
 # ══════════════════════════════════════════════════════════════════════════════
 # FILTERS
@@ -1742,12 +1760,13 @@ def run_stage1():
             if d["subs"] < MIN_SUBS:
                 counts["subs"] += 1
                 continue
-            latest, max_gap_days = get_upload_cadence(d["uploads"])
+            latest, max_gap_days, latest_vid_id = get_upload_cadence(d["uploads"])
             if not latest or latest < cutoff:
                 counts["inactive"] += 1
                 continue
-            d["last_upload"]   = latest.strftime("%Y-%m-%d")
-            d["max_gap_days"]  = max_gap_days  # None if only 1 upload found
+            d["last_upload"]      = latest.strftime("%Y-%m-%d")
+            d["max_gap_days"]     = max_gap_days  # None if only 1 upload found
+            d["latest_video_id"]  = latest_vid_id
             if not passes_personal_brand(d["title"], d["description"]):
                 counts["company"] += 1
                 print(f"  skip [company]      {d['title']}")
@@ -1807,10 +1826,13 @@ def run_stage1():
             print(f"\n  → {ch['title']}")
             links = extract_about_links(page, ch["about_url"], ch["title"])
             yt_email_btn = "Y" if check_yt_email_button(page, ch["url"]) else "N"
+            vid_desc  = get_latest_video_description(ch.get("latest_video_id"))
+            vid_email = extract_emails(vid_desc)[0] if vid_desc and extract_emails(vid_desc) else ""
             cadence_base = {
                 "Last Upload Date":        ch.get("last_upload", ""),
                 "Largest Upload Gap Days": ch.get("max_gap_days", ""),
                 "No-Face Signal":          ch.get("no_face_signal", ""),
+                "Latest Video Email":      vid_email,
             }
             if links:
                 for lk in links:
@@ -1843,7 +1865,8 @@ def run_stage1():
 
     fields = ["Channel Name","Channel URL","Subscribers","Country",
               "Link Label","Destination URL","Page Type","YT Email Button",
-              "Last Upload Date","Largest Upload Gap Days","No-Face Signal"]
+              "Last Upload Date","Largest Upload Gap Days","No-Face Signal",
+              "Latest Video Email"]
     with open(STAGE1_CSV, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader(); w.writerows(rows)
@@ -3153,6 +3176,7 @@ def run_stage3(stage2_rows=None):
                         "Last Upload Date":       r.get("Last Upload Date",""),
                         "Largest Upload Gap Days":r.get("Largest Upload Gap Days",""),
                         "No-Face Signal":         r.get("No-Face Signal",""),
+                        "Latest Video Email":     r.get("Latest Video Email",""),
                     }
                 dest = r.get("Destination URL","")
                 if dest:
@@ -3212,6 +3236,16 @@ def run_stage3(stage2_rows=None):
                     email_source_by_name[n] = "YouTube description"
         except Exception as ex:
             print(f"  [email] description lookup failed: {ex}")
+    # Latest video description emails — creators often put booking/contact emails
+    # in their most recent video description that they don't include in channel bio.
+    for name, s1 in stage1_meta.items():
+        if name in email_by_name:
+            continue
+        vid_email = (s1.get("Latest Video Email","") or "").strip()
+        if vid_email:
+            email_by_name[name] = vid_email
+            email_source_by_name[name] = "latest video description"
+
     # Instagram bio emails — the creator's own IG bio is their voice; any email
     # written there is a genuine contact address (booking, management, etc.).
     for name, igm in ig_meta.items():
