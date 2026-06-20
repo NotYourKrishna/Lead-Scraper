@@ -44,16 +44,152 @@ sys.stdout.reconfigure(encoding="utf-8")
 # ══════════════════════════════════════════════════════════════════════════════
 
 API_KEY           = os.environ.get("YOUTUBE_API_KEY", "")
-NICHE_QUERY       = "dropshipping business"
 MIN_SUBS          = 500
 MAX_DAYS_INACTIVE = 90
-MAX_RESULTS       = 50
+MAX_RESULTS       = 50              # per-query cap from the YouTube search API
 
 CHROME_PATH = r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"
 
-STAGE1_CSV = "stage1_links.csv"
-STAGE2_CSV = "stage2_pages_v2.csv"
-STAGE3_CSV = "stage3_profiles_v7.csv"
+# ── Niche configurations ──────────────────────────────────────────────────────
+# Each niche has: (a) a list of search query variations for discovery, and
+# (b) a target lead count — Stage 1 keeps trying queries until it has either
+# collected `target_leads` qualifying channels or exhausted every variation.
+# Seen channel IDs are persisted per niche (seen_channels.json) so re-runs
+# skip creators already processed.
+NICHE_CONFIGS = {
+    "dropshipping": {
+        "queries": [
+            "dropshipping business",
+            "shopify dropshipping",
+            "ecommerce dropshipping",
+            "shopify business",
+            "ecommerce entrepreneur",
+            "high ticket dropshipping",
+            "shopify tutorial",
+            "online store ecommerce",
+            "ecommerce coaching",
+            "dropshipping mentor",
+        ],
+        "target_leads": 50,
+    },
+    "fitness": {
+        "queries": [
+            "fitness coach", "online personal trainer", "fat loss coach",
+            "muscle building coach", "fitness business", "online fitness coaching",
+            "calisthenics coach", "bodybuilding coach", "nutrition coach",
+            "women's fitness coach",
+        ],
+        "target_leads": 50,
+    },
+    "personal_finance": {
+        "queries": [
+            "personal finance", "financial freedom", "investing for beginners",
+            "stock market investing", "dividend investing", "real estate investing",
+            "passive income", "wealth building", "financial coach", "money management",
+        ],
+        "target_leads": 50,
+    },
+    "business": {
+        "queries": [
+            "online business", "entrepreneur coaching", "business coach",
+            "scale your business", "business mentor", "build an online business",
+            "agency owner", "smma", "consulting business", "service business",
+        ],
+        "target_leads": 50,
+    },
+    "ai": {
+        "queries": [
+            "ai automation business", "ai agency", "ai entrepreneur",
+            "ai tools business", "build with ai", "ai coaching",
+            "chatgpt business", "ai consultant", "ai for business owners",
+            "ai workflow automation",
+        ],
+        "target_leads": 50,
+    },
+    "real_estate": {
+        "queries": [
+            "real estate investing", "wholesale real estate",
+            "real estate entrepreneur", "rental property investing",
+            "airbnb business", "real estate coaching", "house flipping",
+            "real estate mentor", "passive real estate income",
+            "real estate agent business",
+        ],
+        "target_leads": 50,
+    },
+}
+
+# Defaults — overridden by --niche CLI flag in main(); setup_niche() rebinds paths.
+NICHE              = "dropshipping"
+NICHE_QUERY        = NICHE_CONFIGS[NICHE]["queries"][0]   # legacy single-query value
+OUTPUT_DIR         = os.path.join("outputs", NICHE)
+
+# All per-run output paths are derived from OUTPUT_DIR and rebound by setup_niche().
+STAGE1_CSV = os.path.join(OUTPUT_DIR, "stage1_links.csv")
+STAGE2_CSV = os.path.join(OUTPUT_DIR, "stage2_pages.csv")
+STAGE3_CSV = os.path.join(OUTPUT_DIR, "stage3_profiles.csv")
+SEEN_CHANNELS_FILE = os.path.join(OUTPUT_DIR, "seen_channels.json")
+
+# Live funnel metrics — every stage writes here so the end-of-run report can
+# attribute time and counts back to where they were spent.
+RUN_METRICS = {
+    "niche": NICHE,
+    "queries_used": [],
+    "channels_discovered": 0,       # raw IDs returned across all queries
+    "previously_seen_skipped": 0,
+    "unique_candidates": 0,         # discovered minus dedup
+    "filtered_pre_playwright": 0,   # English/geo/subs/inactive/company filters
+    "unique_processed": 0,          # creators that reached Stage 2 crawl
+    "stage1_seconds": 0.0,
+    "stage2_seconds": 0.0,
+    "stage3_seconds": 0.0,
+    "stage4_seconds": 0.0,
+    "stage5_seconds": 0.0,
+}
+
+def setup_niche(niche):
+    """Switch every output path (and the default query list) to a niche slug."""
+    global NICHE, NICHE_QUERY, OUTPUT_DIR
+    global STAGE1_CSV, STAGE2_CSV, STAGE3_CSV, STAGE4_CSV, SEEN_CHANNELS_FILE
+    global CAPTCHA_PENDING_CSV, INSTAGRAM_META_CSV
+    global APPROVED_WITH_EMAIL_CSV, APPROVED_WITHOUT_EMAIL_CSV
+    global MANUAL_REVIEW_WITH_EMAIL_CSV, MANUAL_REVIEW_WITHOUT_EMAIL_CSV
+    global DISQUALIFIED_CSV
+    if niche not in NICHE_CONFIGS:
+        raise SystemExit(
+            f"Unknown niche '{niche}'. Available: {', '.join(sorted(NICHE_CONFIGS))}")
+    NICHE        = niche
+    NICHE_QUERY  = NICHE_CONFIGS[niche]["queries"][0]
+    OUTPUT_DIR   = os.path.join("outputs", niche)
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    STAGE1_CSV          = os.path.join(OUTPUT_DIR, "stage1_links.csv")
+    STAGE2_CSV          = os.path.join(OUTPUT_DIR, "stage2_pages.csv")
+    STAGE3_CSV          = os.path.join(OUTPUT_DIR, "stage3_profiles.csv")
+    STAGE4_CSV          = os.path.join(OUTPUT_DIR, "stage4_scored.csv")
+    SEEN_CHANNELS_FILE  = os.path.join(OUTPUT_DIR, "seen_channels.json")
+    CAPTCHA_PENDING_CSV = os.path.join(OUTPUT_DIR, "captcha_pending.csv")
+    INSTAGRAM_META_CSV  = os.path.join(OUTPUT_DIR, "instagram_meta.csv")
+    APPROVED_WITH_EMAIL_CSV         = os.path.join(OUTPUT_DIR, "APPROVED_WITH_EMAIL.csv")
+    APPROVED_WITHOUT_EMAIL_CSV      = os.path.join(OUTPUT_DIR, "APPROVED_WITHOUT_EMAIL.csv")
+    MANUAL_REVIEW_WITH_EMAIL_CSV    = os.path.join(OUTPUT_DIR, "MANUAL_REVIEW_WITH_EMAIL.csv")
+    MANUAL_REVIEW_WITHOUT_EMAIL_CSV = os.path.join(OUTPUT_DIR, "MANUAL_REVIEW_WITHOUT_EMAIL.csv")
+    DISQUALIFIED_CSV                = os.path.join(OUTPUT_DIR, "DISQUALIFIED.csv")
+    RUN_METRICS["niche"] = niche
+
+def load_seen_channels():
+    if not os.path.exists(SEEN_CHANNELS_FILE):
+        return set()
+    try:
+        with open(SEEN_CHANNELS_FILE, encoding="utf-8") as f:
+            return set(json.load(f))
+    except Exception:
+        return set()
+
+def save_seen_channels(ids):
+    try:
+        with open(SEEN_CHANNELS_FILE, "w", encoding="utf-8") as f:
+            json.dump(sorted(ids), f)
+    except Exception as ex:
+        print(f"  [seen-channels] save failed: {ex}")
 
 DELAY_BETWEEN_CHANNELS = 4
 DELAY_BETWEEN_PAGES    = 2        # seconds between page loads in the crawler
@@ -83,7 +219,7 @@ MAX_FORM_STEPS   = 7               # multi-step qualification forms (Typeform et
 # autopilot — so we NEVER block the batch. When a CAPTCHA is hit we flag that creator,
 # leave its page open in a tab, record it to CAPTCHA_PENDING_CSV, and continue with
 # everyone else. You solve the flagged pages later, then re-run just those creators.
-CAPTCHA_PENDING_CSV = "captcha_pending.csv"
+CAPTCHA_PENDING_CSV = os.path.join(OUTPUT_DIR, "captcha_pending.csv")
 
 # Plausible "ideal high-ticket student" answers, used to traverse qualification
 # forms to their end (where a Calendly/booking link reveals the HT offer). Real
@@ -98,7 +234,7 @@ FORM_FILLER_TEXT = "Looking to scale and ready to invest in the right mentorship
 ENABLE_INSTAGRAM            = True
 IG_CREDENTIALS_FILE         = "ig_credentials.json"   # {"username":..,"password":..}
 IG_SESSION_FILE            = "ig_session.json"        # persisted Playwright storage_state
-INSTAGRAM_META_CSV          = "instagram_meta.csv"    # per-creator IG discovery results
+INSTAGRAM_META_CSV          = os.path.join(OUTPUT_DIR, "instagram_meta.csv")  # per-creator IG discovery results
 MAX_IG_PROFILES_PER_CREATOR = 3                       # seed profile + up to 2 tagged biz accts
 IG_ACTION_DELAY             = 3.0                     # seconds between IG actions (be gentle)
 
@@ -1426,51 +1562,109 @@ def classify_creator(channel_name, rows):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def run_stage1():
+    t0_stage = time.time()
     print("\n" + "═"*70)
     print("STAGE 1 — Discovery + About-page link extraction")
     print("═"*70)
 
-    print(f"\nSearching YouTube: '{NICHE_QUERY}' ({MAX_RESULTS} candidates)")
-    channel_ids = search_channels(NICHE_QUERY, MAX_RESULTS)
-    print(f"API returned {len(channel_ids)} channel IDs\n")
+    cfg          = NICHE_CONFIGS[NICHE]
+    queries      = list(cfg["queries"])
+    target_leads = cfg["target_leads"]
+    seen_ids     = load_seen_channels()
+    print(f"\nNiche: '{NICHE}'   Target qualifying channels: {target_leads}")
+    print(f"Previously processed channels in this niche: {len(seen_ids)}")
+    print(f"Search variations available: {len(queries)}\n")
 
-    cutoff   = datetime.now(timezone.utc) - timedelta(days=MAX_DAYS_INACTIVE)
-    surviving = []
-    counts    = {"english":0,"geo":0,"subs":0,"inactive":0,"company":0}
+    cutoff      = datetime.now(timezone.utc) - timedelta(days=MAX_DAYS_INACTIVE)
+    surviving   = []
+    counts      = {"english":0,"geo":0,"subs":0,"inactive":0,"company":0,"dup":0}
+    raw_total   = 0
+    queries_used = []
+    candidate_ids = []  # unique IDs we'll actually fetch details for
 
-    for cid in channel_ids:
-        d = get_channel_details(cid)
-        if not d:
+    # ── Multi-query discovery ─────────────────────────────────────────────────
+    # Iterate through every search variation, dedup against this run AND prior
+    # runs (via seen_channels.json). Stop early once we have enough survivors.
+    for q in queries:
+        if len(surviving) >= target_leads:
+            break
+        print(f"Searching YouTube: '{q}' ({MAX_RESULTS} candidates)")
+        try:
+            ids = search_channels(q, MAX_RESULTS)
+        except Exception as ex:
+            print(f"  ⚠ search failed for '{q}': {ex}")
             continue
-        resp = youtube.channels().list(part="snippet", id=cid).execute()
-        raw  = resp["items"][0] if resp.get("items") else None
-        if raw and not passes_english(raw):
-            counts["english"] += 1
-            print(f"  skip [non-English]  {d['title']}")
-            continue
-        geo_ok, geo_why = passes_geography(d["country"], d["description"])
-        if not geo_ok:
-            counts["geo"] += 1
-            print(f"  skip [geo: {geo_why}]  {d['title']}")
-            continue
-        if d["subs"] < MIN_SUBS:
-            counts["subs"] += 1
-            continue
-        latest = get_latest_upload(d["uploads"])
-        if not latest or latest < cutoff:
-            counts["inactive"] += 1
-            continue
-        if not passes_personal_brand(d["title"], d["description"]):
-            counts["company"] += 1
-            print(f"  skip [company]      {d['title']}")
-            continue
-        print(f"  PASS                {d['title']} ({d['subs']:,} subs)")
-        surviving.append(d)
-        time.sleep(0.3)
+        queries_used.append(q)
+        raw_total += len(ids)
+        new_ids = []
+        for cid in ids:
+            if cid in seen_ids or cid in candidate_ids:
+                counts["dup"] += 1
+                continue
+            new_ids.append(cid)
+            candidate_ids.append(cid)
+        print(f"  API returned {len(ids)} IDs ({len(new_ids)} new, {len(ids)-len(new_ids)} already seen)")
 
-    print(f"\nFilters: english={counts['english']} geo={counts['geo']} "
+        for cid in new_ids:
+            if len(surviving) >= target_leads:
+                break
+            d = get_channel_details(cid)
+            if not d:
+                continue
+            resp = youtube.channels().list(part="snippet", id=cid).execute()
+            raw  = resp["items"][0] if resp.get("items") else None
+            if raw and not passes_english(raw):
+                counts["english"] += 1
+                print(f"  skip [non-English]  {d['title']}")
+                continue
+            geo_ok, geo_why = passes_geography(d["country"], d["description"])
+            if not geo_ok:
+                counts["geo"] += 1
+                print(f"  skip [geo: {geo_why}]  {d['title']}")
+                continue
+            if d["subs"] < MIN_SUBS:
+                counts["subs"] += 1
+                continue
+            latest = get_latest_upload(d["uploads"])
+            if not latest or latest < cutoff:
+                counts["inactive"] += 1
+                continue
+            if not passes_personal_brand(d["title"], d["description"]):
+                counts["company"] += 1
+                print(f"  skip [company]      {d['title']}")
+                continue
+            print(f"  PASS                {d['title']} ({d['subs']:,} subs)")
+            surviving.append(d)
+            time.sleep(0.3)
+
+        print(f"  → survivors so far: {len(surviving)}/{target_leads}\n")
+
+    if len(surviving) < target_leads:
+        print(f"Exhausted all {len(queries_used)} search variations "
+              f"without hitting the {target_leads}-survivor target.\n")
+
+    print(f"Discovery summary:")
+    print(f"  Queries used:           {len(queries_used)} of {len(queries)}")
+    print(f"  Raw IDs returned:       {raw_total}")
+    print(f"  Unique candidates:      {len(candidate_ids)}")
+    print(f"  Previously seen skip:   {counts['dup']}")
+    print(f"  Filters: english={counts['english']} geo={counts['geo']} "
           f"subs={counts['subs']} inactive={counts['inactive']} company={counts['company']}")
     print(f"Surviving for Playwright scan: {len(surviving)}\n")
+
+    # Persist seen IDs (existing + everything we touched this run)
+    seen_ids.update(candidate_ids)
+    save_seen_channels(seen_ids)
+
+    # Record metrics for the end-of-run report
+    RUN_METRICS["queries_used"]            = queries_used
+    RUN_METRICS["channels_discovered"]     = raw_total
+    RUN_METRICS["previously_seen_skipped"] = counts["dup"]
+    RUN_METRICS["unique_candidates"]       = len(candidate_ids)
+    RUN_METRICS["filtered_pre_playwright"] = (counts["english"] + counts["geo"]
+                                              + counts["subs"] + counts["inactive"]
+                                              + counts["company"])
+    RUN_METRICS["unique_processed"]        = len(surviving)
 
     rows = []
     with sync_playwright() as p:
@@ -1527,6 +1721,7 @@ def run_stage1():
 
     link_count = sum(1 for r in rows if r["Destination URL"])
     print(f"\n✓ Stage 1 — {len(surviving)} channels, {link_count} links → {STAGE1_CSV}")
+    RUN_METRICS["stage1_seconds"] = time.time() - t0_stage
     return rows
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2514,6 +2709,7 @@ def run_stage2(stage1_rows=None, extra_seeds=None):
     extra_seeds: dict mapping channel_name → [additional_url, ...]
     e.g. {"Jordan Welch": ["https://linktr.ee/jordanwelch"]}
     """
+    t0_stage = time.time()
     print("\n" + "═"*70)
     print("STAGE 2 — Recursive funnel crawler")
     print("═"*70)
@@ -2670,6 +2866,7 @@ def run_stage2(stage1_rows=None, extra_seeds=None):
     if captcha_rows:
         print(f"  ⚠ {len(captcha_rows)} CAPTCHA page(s) deferred → {CAPTCHA_PENDING_CSV} "
               f"(solve manually, then re-run those creators)")
+    RUN_METRICS["stage2_seconds"] = time.time() - t0_stage
     return all_page_rows
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2688,6 +2885,7 @@ def angle_bucket(angle):
 
 
 def run_stage3(stage2_rows=None):
+    t0_stage = time.time()
     print("\n" + "═"*70)
     print("STAGE 3 — Creator classification")
     print("═"*70 + "\n")
@@ -2889,6 +3087,7 @@ def run_stage3(stage2_rows=None):
           f"{needs_data} need more data → {STAGE3_CSV}")
     print(f"  Confidence breakdown: High={high_conf}  Medium={med_conf}  Low={low_conf}")
     print(f"  HT score breakdown:   High={ht_high}  Medium={ht_med}")
+    RUN_METRICS["stage3_seconds"] = time.time() - t0_stage
     return out_rows
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2906,7 +3105,7 @@ def run_stage3(stage2_rows=None):
 # Only QUALIFIED leads are scored. Disqualified / suspected-HT / endpoint-uncertain
 # / needs-data rows are passed through with a status and no score.
 
-STAGE4_CSV = "stage4_scored_v1.csv"
+STAGE4_CSV = os.path.join(OUTPUT_DIR, "stage4_scored.csv")
 
 # Confidence → multiplier (applied to the raw score)
 CONF_FACTOR = {"High": 1.0, "Medium": 0.82, "Low": 0.6, "": 0.7}
@@ -3055,6 +3254,7 @@ def score_lead(row):
 
 
 def run_stage4(stage3_rows=None):
+    t0_stage = time.time()
     print("\n" + "═"*70)
     print("STAGE 4 — ICP scoring")
     print("═"*70 + "\n")
@@ -3118,6 +3318,7 @@ def run_stage4(stage3_rows=None):
 
     print(f"✓ Stage 4 — {len(scored_leads)} leads scored "
           f"({len(others)} passed through unscored) → {STAGE4_CSV}")
+    RUN_METRICS["stage4_seconds"] = time.time() - t0_stage
     return ranked
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3128,10 +3329,11 @@ def run_stage4(stage3_rows=None):
 # NO rejected sheet. Bias is toward MANUAL_REVIEW — we would rather hand-check 20
 # extra creators than send outreach to someone already running a mature HT backend.
 
-APPROVED_WITH_EMAIL_CSV    = "APPROVED_WITH_EMAIL.csv"
-APPROVED_WITHOUT_EMAIL_CSV = "APPROVED_WITHOUT_EMAIL.csv"
-MANUAL_REVIEW_WITH_EMAIL_CSV    = "MANUAL_REVIEW_WITH_EMAIL.csv"
-MANUAL_REVIEW_WITHOUT_EMAIL_CSV = "MANUAL_REVIEW_WITHOUT_EMAIL.csv"
+APPROVED_WITH_EMAIL_CSV    = os.path.join(OUTPUT_DIR, "APPROVED_WITH_EMAIL.csv")
+APPROVED_WITHOUT_EMAIL_CSV = os.path.join(OUTPUT_DIR, "APPROVED_WITHOUT_EMAIL.csv")
+MANUAL_REVIEW_WITH_EMAIL_CSV    = os.path.join(OUTPUT_DIR, "MANUAL_REVIEW_WITH_EMAIL.csv")
+MANUAL_REVIEW_WITHOUT_EMAIL_CSV = os.path.join(OUTPUT_DIR, "MANUAL_REVIEW_WITHOUT_EMAIL.csv")
+DISQUALIFIED_CSV                = os.path.join(OUTPUT_DIR, "DISQUALIFIED.csv")
 
 _RATING_ORDER = ["D", "C", "B", "A", "S"]   # ascending
 
@@ -3252,7 +3454,20 @@ def _review_note(row):
     return "; ".join(reasons)
 
 
+def _disqualification_reason(row):
+    """Human-readable reason this creator was disqualified, derived from
+    the strongest signal we have. Used for the DISQUALIFIED.csv audit trail."""
+    angle = row.get("Outreach Angle","") or ""
+    if angle_bucket(angle) == "DISQUALIFIED":
+        deepest = row.get("Deepest Monetization Layer","")
+        if deepest:
+            return f"HT backend detected: {deepest}"
+        return "HT backend detected"
+    # Not HT-disqualified — must be a no-contact-path drop
+    return "No contact path (no public email and no YouTube email button)"
+
 def build_outreach_sheets(stage3_rows=None):
+    t0_stage = time.time()
     print("\n" + "═"*70)
     print("STAGE 5 — Outreach routing (contactability-based)")
     print("═"*70 + "\n")
@@ -3263,20 +3478,34 @@ def build_outreach_sheets(stage3_rows=None):
 
     ap_with, ap_without = [], []
     mr_with, mr_without = [], []
-    removed, discarded_no_contact = 0, 0
+    disqualified_rows   = []   # 5th bucket — every dropped creator has an audit row
 
     for row in stage3_rows:
-        if angle_bucket(row.get("Outreach Angle","")) == "DISQUALIFIED":
-            removed += 1
-            continue
+        is_ht_disqualified = angle_bucket(row.get("Outreach Angle","")) == "DISQUALIFIED"
+        email              = (row.get("Email","") or "").strip()
+        yt_btn             = row.get("YT Email Button","N") == "Y"
+        has_email          = bool(email)
+        contactable        = has_email or yt_btn
 
-        email       = (row.get("Email","") or "").strip()
-        yt_btn      = row.get("YT Email Button","N") == "Y"
-        has_email   = bool(email)
-        contactable = has_email or yt_btn
-
-        if not contactable:
-            discarded_no_contact += 1
+        # ── DISQUALIFIED bucket — every dropped creator lands here ───────────
+        # Includes (a) HT-backend creators and (b) creators with no contact path.
+        # Nothing is silently discarded; this file is the audit trail for the
+        # qualification engine.
+        if is_ht_disqualified or not contactable:
+            disqualified_rows.append({
+                "Channel Name":              row.get("Channel Name",""),
+                "Subscribers":               row.get("Subscribers",""),
+                "Email":                     email,
+                "Channel Link":              row.get("Channel URL",""),
+                "HT Score":                  row.get("HT Score",""),
+                "HT Level":                  row.get("HT Level",""),
+                "Disqualification Reason":   _disqualification_reason(row),
+                "Evidence":                  row.get("HT Signals Found","") or row.get("Outreach Angle",""),
+                "Deepest Monetization Layer":row.get("Deepest Monetization Layer",""),
+                "Highest Offer Type Found":  row.get("Highest Offer Type Found",""),
+                "Confidence":                row.get("Data Confidence",""),
+                "YT Email Button":           "Y" if yt_btn else "N",
+            })
             continue
 
         common = {
@@ -3337,29 +3566,47 @@ def build_outreach_sheets(stage3_rows=None):
                  "YT Email Button","Outreach Angle","Notes"]
     mr_fields = ["Channel Name","Subscribers","Email","Channel Link",
                  "YT Email Button","Confidence","Rating","Outreach Angle","Notes"]
+    dq_fields = ["Channel Name","Subscribers","Email","Channel Link",
+                 "HT Score","HT Level","Disqualification Reason","Evidence",
+                 "Deepest Monetization Layer","Highest Offer Type Found",
+                 "Confidence","YT Email Button"]
+
+    # Stable sort for the audit file: heaviest evidence first, then by subs.
+    ht_rank = {"High":3, "Medium":2, "Low":1, "None":0, "":0}
+    disqualified_rows.sort(
+        key=lambda r: (ht_rank.get(r.get("HT Level",""), 0), _subs_int(r["Subscribers"])),
+        reverse=True,
+    )
 
     _safe_write_csv(APPROVED_WITH_EMAIL_CSV, ap_fields, ap_with)
     _safe_write_csv(APPROVED_WITHOUT_EMAIL_CSV, ap_fields, ap_without)
     _safe_write_csv(MANUAL_REVIEW_WITH_EMAIL_CSV, mr_fields, mr_with)
     _safe_write_csv(MANUAL_REVIEW_WITHOUT_EMAIL_CSV, mr_fields, mr_without)
+    _safe_write_csv(DISQUALIFIED_CSV, dq_fields, disqualified_rows)
 
     # ── Summary report ────────────────────────────────────────────────────────
     total_approved = len(ap_with) + len(ap_without)
     total_review   = len(mr_with) + len(mr_without)
+    total_disq     = len(disqualified_rows)
+    dq_ht          = sum(1 for r in disqualified_rows
+                         if r["Disqualification Reason"].startswith("HT"))
+    dq_no_contact  = total_disq - dq_ht
     rc = {}
     for ltr in _RATING_ORDER:
         rc[ltr] = sum(1 for r in mr_with + mr_without if r["Rating"]==ltr)
 
     print(f"  Creators scanned:          {len(stage3_rows)}")
-    print(f"  Disqualified (HT removed): {removed}")
-    print(f"  Discarded (no contact):    {discarded_no_contact}  (no email + no YT email button)")
+    print(f"  Disqualified:              {total_disq}  "
+          f"(HT backend: {dq_ht}, no contact path: {dq_no_contact})")
     print()
     print(f"  APPROVED with email:       {len(ap_with):>3}  → {APPROVED_WITH_EMAIL_CSV}")
     print(f"  APPROVED without email:    {len(ap_without):>3}  → {APPROVED_WITHOUT_EMAIL_CSV}")
     print(f"  MANUAL REVIEW with email:  {len(mr_with):>3}  → {MANUAL_REVIEW_WITH_EMAIL_CSV}")
     print(f"  MANUAL REVIEW without:     {len(mr_without):>3}  → {MANUAL_REVIEW_WITHOUT_EMAIL_CSV}")
+    print(f"  DISQUALIFIED (audit):      {total_disq:>3}  → {DISQUALIFIED_CSV}")
     print()
-    print(f"  Total approved:  {total_approved}   Total review:  {total_review}")
+    print(f"  Total approved:  {total_approved}   Total review:  {total_review}   "
+          f"Total disqualified:  {total_disq}")
     print(f"  Ratings: S={rc['S']}  A={rc['A']}  B={rc['B']}  C={rc['C']}  D={rc['D']}")
     print()
 
@@ -3382,20 +3629,76 @@ def build_outreach_sheets(stage3_rows=None):
             print(f"    [{r['Rating']}] {e_tag} {r['Channel Name'][:26]:<26} {_subs_int(r['Subscribers']):>9,}  "
                   f"{r.get('Confidence',''):<7} {r['Notes'][:55]}")
 
-    return ap_with, ap_without, mr_with, mr_without
+    RUN_METRICS["stage5_seconds"] = time.time() - t0_stage
+    return ap_with, ap_without, mr_with, mr_without, disqualified_rows
 
 # ══════════════════════════════════════════════════════════════════════════════
 # MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 
+def print_funnel_report(ap_w, ap_wo, mr_w, mr_wo, disq, elapsed_sec):
+    """End-of-run funnel report. Reads counts from RUN_METRICS so every stage
+    contributes; gives visibility into where time and creators were spent and
+    whether qualification logic is too strict or too loose."""
+    M = RUN_METRICS
+    processed = M["unique_processed"] or (len(ap_w)+len(ap_wo)+len(mr_w)+len(mr_wo)+len(disq))
+    eligible  = len(ap_w) + len(ap_wo) + len(mr_w) + len(mr_wo)
+
+    def _rate(n, d):
+        return f"{(n/d*100):.1f}%" if d > 0 else "—"
+
+    avg_crawl = (M["stage2_seconds"] / processed) if processed > 0 else 0
+    leads_per_hour = (eligible / (elapsed_sec / 3600)) if elapsed_sec > 0 else 0
+
+    print(f"\n{'═'*70}")
+    print(f"FUNNEL REPORT — niche: {M['niche']}")
+    print(f"{'═'*70}\n")
+
+    print(f"  Discovery")
+    print(f"    Queries used:                {len(M['queries_used'])}  ({', '.join(M['queries_used'][:5])}{'...' if len(M['queries_used'])>5 else ''})")
+    print(f"    Creators Discovered:         {M['channels_discovered']}")
+    print(f"    Previously Seen / Skipped:   {M['previously_seen_skipped']}")
+    print(f"    Unique Candidates:           {M['unique_candidates']}")
+    print(f"    Filtered Pre-Playwright:     {M['filtered_pre_playwright']}  (English/geo/subs/inactive/company)")
+    print(f"    Unique Creators Processed:   {processed}")
+    print()
+    print(f"  Routing")
+    print(f"    Disqualified:                {len(disq)}")
+    print(f"    Manual Review With Email:    {len(mr_w)}")
+    print(f"    Manual Review Without Email: {len(mr_wo)}")
+    print(f"    Approved With Email:         {len(ap_w)}")
+    print(f"    Approved Without Email:      {len(ap_wo)}")
+    print(f"    Total Outreach-Eligible:     {eligible}")
+    print()
+    print(f"  Rates  (over {processed} processed)")
+    print(f"    Approval Rate:               {_rate(len(ap_w)+len(ap_wo), processed)}")
+    print(f"    Disqualification Rate:       {_rate(len(disq), processed)}")
+    print(f"    Manual Review Rate:          {_rate(len(mr_w)+len(mr_wo), processed)}")
+    print()
+    print(f"  Timing")
+    print(f"    Stage 1 (discovery):         {M['stage1_seconds']:>7.1f}s")
+    print(f"    Stage 2 (crawl):             {M['stage2_seconds']:>7.1f}s")
+    print(f"    Stage 3 (classify):          {M['stage3_seconds']:>7.1f}s")
+    print(f"    Stage 4 (score):             {M['stage4_seconds']:>7.1f}s")
+    print(f"    Stage 5 (route):             {M['stage5_seconds']:>7.1f}s")
+    print(f"    Avg Crawl Time Per Creator:  {avg_crawl:>7.1f}s")
+    print(f"    Total Runtime:               {elapsed_sec/60:>7.1f} min")
+    print(f"    Leads Per Hour:              {leads_per_hour:>7.1f}")
+    print(f"{'═'*70}\n")
+
+
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
+    parser.add_argument("--niche", type=str, default="dropshipping",
+                        choices=sorted(NICHE_CONFIGS.keys()),
+                        help="Which niche config to use (search queries + target lead count)")
     parser.add_argument("--from-stage", type=int, default=1,
                         help="Resume from stage (1=full, 2=skip discovery, 3=skip fetching, "
                              "4=score+route only, 5=route only)")
     args = parser.parse_args()
 
+    setup_niche(args.niche)
     t0 = time.time()
 
     if args.from_stage <= 1:
@@ -3421,12 +3724,11 @@ if __name__ == "__main__":
 
     if args.from_stage <= 4:
         run_stage4(stage3_rows)                 # ICP scoring (internal artifact)
-    ap_w, ap_wo, mr_w, mr_wo = build_outreach_sheets(stage3_rows)
+    ap_w, ap_wo, mr_w, mr_wo, disq = build_outreach_sheets(stage3_rows)
 
-    elapsed = (time.time()-t0)/60
-    print(f"\n{'═'*70}")
-    print(f"Pipeline complete in {elapsed:.1f} min")
+    elapsed = time.time() - t0
+    print_funnel_report(ap_w, ap_wo, mr_w, mr_wo, disq, elapsed)
     print(f"  {STAGE3_CSV} — creator profiles (full detail)")
-    print(f"  APPROVED:  {len(ap_w)} with email, {len(ap_wo)} without (YT button)")
-    print(f"  REVIEW:    {len(mr_w)} with email, {len(mr_wo)} without (YT button)")
-    print(f"{'═'*70}")
+    print(f"  APPROVED:    {len(ap_w)} with email, {len(ap_wo)} without (YT button)")
+    print(f"  REVIEW:      {len(mr_w)} with email, {len(mr_wo)} without (YT button)")
+    print(f"  DISQUALIFIED: {len(disq)} (HT backend or no contact path)")

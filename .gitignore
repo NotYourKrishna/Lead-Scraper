@@ -13,7 +13,11 @@ __pycache__/
 # Claude internal
 .claude/
 
-# Intermediate pipeline CSVs (large, regenerable)
+# Per-niche pipeline outputs (large, regenerable; one folder per niche).
+outputs/
+
+# Legacy root-level intermediate CSVs from the pre-niche-folder layout.
+stage1_links.csv
 stage2_pages.csv
 stage2_pages_v2.csv
 stage3_profiles.csv
@@ -22,6 +26,17 @@ stage3_profiles_v3.csv
 stage3_profiles_v4.csv
 stage3_profiles_v5.csv
 stage3_profiles_v6.csv
+stage3_profiles_v7.csv
+stage4_scored_v1.csv
+captcha_pending.csv
+instagram_meta.csv
+
+# Legacy root-level final CSVs (now under outputs/<niche>/)
+APPROVED_WITH_EMAIL.csv
+APPROVED_WITHOUT_EMAIL.csv
+MANUAL_REVIEW_WITH_EMAIL.csv
+MANUAL_REVIEW_WITHOUT_EMAIL.csv
+DISQUALIFIED.csv
 
 # Old versioned lead files
 leads_dropshipping_test.csv
