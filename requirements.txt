@@ -2,4 +2,3 @@ google-api-python-client
 requests
 beautifulsoup4
 python-dotenv
-undetected-chromedriver

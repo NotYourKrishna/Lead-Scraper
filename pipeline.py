@@ -262,56 +262,47 @@ def channel_id_from_url(url):
     m = re.search(r"/channel/([A-Za-z0-9_\-]+)", url or "")
     return m.group(1) if m else ""
 
-def get_hidden_email(channel_url):
-    """Click the 'View email address' button on a YouTube About page via
-    undetected_chromedriver to bypass the reCAPTCHA gate that hides the email.
-    Returns the first non-Google/YouTube email found, or None."""
+def check_yt_email_button(page, channel_url):
+    """Check if a YouTube channel's 'More info' panel contains a 'View email
+    address' button. Does NOT click the email button — just detects its presence.
+    Returns True/False. Expects Playwright page already on the channel."""
     try:
-        import undetected_chromedriver as uc
-        from selenium.webdriver.common.by import By
-        from selenium.webdriver.support.ui import WebDriverWait
-        from selenium.webdriver.support import expected_conditions as EC
-    except ImportError:
-        return None
-
-    options = uc.ChromeOptions()
-    options.add_argument("--no-sandbox")
-    options.add_argument("--headless=new")
-    options.binary_location = CHROME_PATH
-
-    driver = None
-    try:
-        driver = uc.Chrome(options=options)
-        about_url = channel_url.rstrip("/") + "/about"
-        driver.get(about_url)
-        time.sleep(4)
-
-        try:
-            btn = WebDriverWait(driver, 6).until(
-                EC.element_to_be_clickable((
-                    By.XPATH,
-                    "//*[contains(text(),'View email address') "
-                    "or contains(@aria-label,'View email')]"
-                ))
-            )
-            btn.click()
-            time.sleep(2)
-        except Exception:
-            return None
-
-        page_text = driver.find_element(By.TAG_NAME, "body").text
-        emails = extract_emails(page_text)
-        return emails[0] if emails else None
-
-    except Exception as ex:
-        print(f"  [hidden-email] {ex}")
-        return None
-    finally:
-        if driver:
+        # Open the 'More info' panel via the '...more' / 'and X more links' element
+        for selector in (
+            "text=/and \\d+ more link/",
+            "text=/\\.\\.\\.more/",
+            "#channel-header-links a",
+        ):
             try:
-                driver.quit()
+                el = page.locator(selector).first
+                if el.count() and el.is_visible(timeout=2000):
+                    el.click()
+                    page.wait_for_timeout(2000)
+                    break
             except Exception:
-                pass
+                continue
+
+        # Check for the email icon/link in the resulting panel / page.
+        # When not signed in, YouTube shows "Sign in to see email address".
+        # When signed in, it shows "View email address". Match both.
+        btn = page.locator("text=/see email address|View email address/i")
+        found = btn.count() > 0
+        if found:
+            print(f"      [YT email button] ✓ present")
+        else:
+            print(f"      [YT email button] ✗ not found")
+
+        # Close any popup/dialog that opened
+        try:
+            page.keyboard.press("Escape")
+            page.wait_for_timeout(500)
+        except Exception:
+            pass
+
+        return found
+    except Exception as ex:
+        print(f"      [YT email button] error: {ex}")
+        return False
 
 # ══════════════════════════════════════════════════════════════════════════════
 # YOUTUBE API HELPERS
@@ -627,7 +618,9 @@ HT_STRUCTURAL_SIGNALS = [
         "one-on-one coaching", "1:1 mentorship", "private client",
         "work with me privately", "work with me 1:1", "vip day"]),
     ("mastermind",   ["mastermind"]),
-    ("done-for-you", ["done for you", "done-for-you", "dfy "]),
+    ("done-for-you", ["done for you", "done-for-you", "dfy ",
+                      "with our team in your corner", "with our team behind you",
+                      "our team will build", "we build it for you"]),
     ("high-ticket",  ["high ticket", "high-ticket"]),
     ("accelerator",  ["accelerator", "incubator"]),
     ("sales team",   ["setters", "closers", "sales team", "appointment setter"]),
@@ -1498,6 +1491,7 @@ def run_stage1():
         for ch in surviving:
             print(f"\n  → {ch['title']}")
             links = extract_about_links(page, ch["about_url"], ch["title"])
+            yt_email_btn = "Y" if check_yt_email_button(page, ch["url"]) else "N"
             if links:
                 for lk in links:
                     rows.append({
@@ -1508,6 +1502,7 @@ def run_stage1():
                         "Link Label":      lk["label"],
                         "Destination URL": lk["url"],
                         "Page Type":       detect_page_type(lk["url"]),
+                        "YT Email Button": yt_email_btn,
                     })
             else:
                 rows.append({
@@ -1518,13 +1513,14 @@ def run_stage1():
                     "Link Label":      "(none found)",
                     "Destination URL": "",
                     "Page Type":       "",
+                    "YT Email Button": yt_email_btn,
                 })
             time.sleep(DELAY_BETWEEN_CHANNELS)
 
         browser.close()
 
     fields = ["Channel Name","Channel URL","Subscribers","Country",
-              "Link Label","Destination URL","Page Type"]
+              "Link Label","Destination URL","Page Type","YT Email Button"]
     with open(STAGE1_CSV, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader(); w.writerows(rows)
@@ -2713,6 +2709,7 @@ def run_stage3(stage2_rows=None):
                         "Channel URL": r["Channel URL"],
                         "Subscribers": r.get("Subscribers",""),
                         "Country":     r.get("Country",""),
+                        "YT Email Button": r.get("YT Email Button",""),
                     }
                 # Some About-page "links" are actually email addresses
                 for e in extract_emails(r.get("Destination URL","")):
@@ -2773,25 +2770,12 @@ def run_stage3(stage2_rows=None):
         if es:
             email_by_name[name] = es[0]
 
-    # Hidden-email fallback: click YouTube's "View email address" button via
-    # undetected_chromedriver to bypass the reCAPTCHA gate on the About page.
-    for name, m in meta.items():
-        if name in email_by_name:
-            continue
-        ch_url = m.get("Channel URL", "")
-        if not ch_url:
-            continue
-        print(f"  [hidden-email] trying YouTube About page for {name} …")
-        e = get_hidden_email(ch_url)
-        if e:
-            print(f"  [hidden-email] found {e} for {name}")
-            email_by_name[name] = e
-
     out_rows = []
     for name, rows in by_creator.items():
         print(f"  Classifying: {name}")
         classification = classify_creator(name, rows)
         classification["Email"] = email_by_name.get(name, "")
+        classification["YT Email Button"] = stage1_meta.get(name, {}).get("YT Email Button", "")
 
         # ── Instagram-assisted discovery fields ───────────────────────────────
         igm = ig_meta.get(name, {})
@@ -2884,7 +2868,7 @@ def run_stage3(stage2_rows=None):
         "Instagram Used","Instagram Profiles Visited","Instagram Bio Links Found",
         "Instagram Business Accounts Found","Instagram Assisted Discovery",
         "Previous Classification","New Classification","Evidence Found Via Instagram",
-        "Pages Crawled",
+        "Pages Crawled","YT Email Button",
     ]
     with open(STAGE3_CSV, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fields)
@@ -3144,8 +3128,10 @@ def run_stage4(stage3_rows=None):
 # NO rejected sheet. Bias is toward MANUAL_REVIEW — we would rather hand-check 20
 # extra creators than send outreach to someone already running a mature HT backend.
 
-APPROVED_CSV      = "APPROVED_FOR_OUTREACH.csv"
-MANUAL_REVIEW_CSV = "MANUAL_REVIEW.csv"
+APPROVED_WITH_EMAIL_CSV    = "APPROVED_WITH_EMAIL.csv"
+APPROVED_WITHOUT_EMAIL_CSV = "APPROVED_WITHOUT_EMAIL.csv"
+MANUAL_REVIEW_WITH_EMAIL_CSV    = "MANUAL_REVIEW_WITH_EMAIL.csv"
+MANUAL_REVIEW_WITHOUT_EMAIL_CSV = "MANUAL_REVIEW_WITHOUT_EMAIL.csv"
 
 _RATING_ORDER = ["D", "C", "B", "A", "S"]   # ascending
 
@@ -3268,94 +3254,135 @@ def _review_note(row):
 
 def build_outreach_sheets(stage3_rows=None):
     print("\n" + "═"*70)
-    print("STAGE 5 — Outreach routing (Approved / Manual Review)")
+    print("STAGE 5 — Outreach routing (contactability-based)")
     print("═"*70 + "\n")
 
     if stage3_rows is None:
         with open(STAGE3_CSV, newline="", encoding="utf-8") as f:
             stage3_rows = list(csv.DictReader(f))
 
-    approved, review, removed = [], [], 0
+    ap_with, ap_without = [], []
+    mr_with, mr_without = [], []
+    removed, discarded_no_contact = 0, 0
+
     for row in stage3_rows:
-        # Disqualified leads (confirmed HT backend) are dropped entirely — they
-        # never enter either sheet. (Suspected/weak HT stays in MANUAL_REVIEW.)
         if angle_bucket(row.get("Outreach Angle","")) == "DISQUALIFIED":
             removed += 1
             continue
-        email = (row.get("Email","") or "").strip()
+
+        email       = (row.get("Email","") or "").strip()
+        yt_btn      = row.get("YT Email Button","N") == "Y"
+        has_email   = bool(email)
+        contactable = has_email or yt_btn
+
+        if not contactable:
+            discarded_no_contact += 1
+            continue
+
         common = {
-            "Channel Name":   row.get("Channel Name",""),
-            "Subscribers":    row.get("Subscribers",""),
-            "Email":          email,
-            "Channel Link":   row.get("Channel URL",""),
-            "Outreach Angle": row.get("Outreach Angle",""),
+            "Channel Name":     row.get("Channel Name",""),
+            "Subscribers":      row.get("Subscribers",""),
+            "Email":            email,
+            "Channel Link":     row.get("Channel URL",""),
+            "YT Email Button":  "Y" if yt_btn else "N",
+            "Outreach Angle":   row.get("Outreach Angle",""),
         }
+
         if _is_approved(row):
-            approved.append({**common,
+            entry = {**common,
                 "Notes": _approved_note(row),
                 "_attr": _attractiveness(row),
                 "_conf": row.get("Data Confidence",""),
-            })
+            }
+            if has_email:
+                ap_with.append(entry)
+            else:
+                ap_without.append(entry)
         else:
-            review.append({**common,
+            entry = {**common,
                 "Confidence": row.get("Data Confidence",""),
                 "Rating":     _rating(row),
                 "Notes":      _review_note(row),
                 "_attr": _attractiveness(row),
-            })
+            }
+            if has_email:
+                mr_with.append(entry)
+            else:
+                mr_without.append(entry)
 
-    # Sort APPROVED by attractiveness, subs, confidence
+    # Sort by attractiveness / rating
     conf_rank = {"High":3, "Medium":2, "Low":1, "":0}
-    approved.sort(key=lambda r: (r["_attr"], _subs_int(r["Subscribers"]),
-                                 conf_rank.get(r["_conf"],0)), reverse=True)
-    # Sort MANUAL_REVIEW by rating, subs, confidence
-    review.sort(key=lambda r: (_RATING_ORDER.index(r["Rating"]),
-                               _subs_int(r["Subscribers"]),
-                               conf_rank.get(r["Confidence"],0)), reverse=True)
+    for lst in (ap_with, ap_without):
+        lst.sort(key=lambda r: (r["_attr"], _subs_int(r["Subscribers"]),
+                                 conf_rank.get(r.get("_conf",""),0)), reverse=True)
+    for lst in (mr_with, mr_without):
+        lst.sort(key=lambda r: (_RATING_ORDER.index(r["Rating"]),
+                                 _subs_int(r["Subscribers"]),
+                                 conf_rank.get(r.get("Confidence",""),0)), reverse=True)
 
     def _safe_write_csv(path, fields, data):
-        """Write CSV; if the file is open in Excel (locked), fall back to <name>.new.csv."""
         target = path
         try:
             f = open(path, "w", newline="", encoding="utf-8")
         except PermissionError:
             target = path.replace(".csv", ".new.csv")
-            print(f"  ⚠ {path} is open (Excel?) — writing to {target} instead. "
-                  f"Close the file and re-run to refresh the original.")
+            print(f"  ⚠ {path} is open (Excel?) — writing to {target} instead.")
             f = open(target, "w", newline="", encoding="utf-8")
         with f:
             w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
             w.writeheader(); w.writerows(data)
         return target
 
-    ap_fields = ["Channel Name","Subscribers","Email","Channel Link","Outreach Angle","Notes"]
-    _safe_write_csv(APPROVED_CSV, ap_fields, approved)
+    ap_fields = ["Channel Name","Subscribers","Email","Channel Link",
+                 "YT Email Button","Outreach Angle","Notes"]
     mr_fields = ["Channel Name","Subscribers","Email","Channel Link",
-                 "Confidence","Rating","Outreach Angle","Notes"]
-    _safe_write_csv(MANUAL_REVIEW_CSV, mr_fields, review)
+                 "YT Email Button","Confidence","Rating","Outreach Angle","Notes"]
+
+    _safe_write_csv(APPROVED_WITH_EMAIL_CSV, ap_fields, ap_with)
+    _safe_write_csv(APPROVED_WITHOUT_EMAIL_CSV, ap_fields, ap_without)
+    _safe_write_csv(MANUAL_REVIEW_WITH_EMAIL_CSV, mr_fields, mr_with)
+    _safe_write_csv(MANUAL_REVIEW_WITHOUT_EMAIL_CSV, mr_fields, mr_without)
 
     # ── Summary report ────────────────────────────────────────────────────────
-    rc = {ltr: sum(1 for r in review if r["Rating"]==ltr) for ltr in _RATING_ORDER}
-    print(f"  Creators scanned:        {len(stage3_rows)}")
-    print(f"  Disqualified (removed):  {removed}  (confirmed HT backend — dropped from pipeline)")
-    print(f"  Approved for outreach:   {len(approved)}  → {APPROVED_CSV}")
-    print(f"  Manual review required:  {len(review)}  → {MANUAL_REVIEW_CSV}")
-    print(f"    S-rated: {rc['S']}   A-rated: {rc['A']}   B-rated: {rc['B']}   "
-          f"C-rated: {rc['C']}   D-rated: {rc['D']}")
-    print()
-    if approved:
-        print("  APPROVED:")
-        for r in approved:
-            print(f"    ✓ {r['Channel Name'][:30]:<30} {_subs_int(r['Subscribers']):>9,} subs  "
-                  f"{r['Email'] or '(no email)'}")
-            print(f"        {r['Notes']}")
-    print()
-    print("  MANUAL REVIEW (top of list):")
-    for r in review[:12]:
-        print(f"    [{r['Rating']}] {r['Channel Name'][:28]:<28} {_subs_int(r['Subscribers']):>9,}  "
-              f"{r['Confidence']:<7} {r['Notes'][:60]}")
+    total_approved = len(ap_with) + len(ap_without)
+    total_review   = len(mr_with) + len(mr_without)
+    rc = {}
+    for ltr in _RATING_ORDER:
+        rc[ltr] = sum(1 for r in mr_with + mr_without if r["Rating"]==ltr)
 
-    return approved, review
+    print(f"  Creators scanned:          {len(stage3_rows)}")
+    print(f"  Disqualified (HT removed): {removed}")
+    print(f"  Discarded (no contact):    {discarded_no_contact}  (no email + no YT email button)")
+    print()
+    print(f"  APPROVED with email:       {len(ap_with):>3}  → {APPROVED_WITH_EMAIL_CSV}")
+    print(f"  APPROVED without email:    {len(ap_without):>3}  → {APPROVED_WITHOUT_EMAIL_CSV}")
+    print(f"  MANUAL REVIEW with email:  {len(mr_with):>3}  → {MANUAL_REVIEW_WITH_EMAIL_CSV}")
+    print(f"  MANUAL REVIEW without:     {len(mr_without):>3}  → {MANUAL_REVIEW_WITHOUT_EMAIL_CSV}")
+    print()
+    print(f"  Total approved:  {total_approved}   Total review:  {total_review}")
+    print(f"  Ratings: S={rc['S']}  A={rc['A']}  B={rc['B']}  C={rc['C']}  D={rc['D']}")
+    print()
+
+    if ap_with:
+        print("  APPROVED WITH EMAIL:")
+        for r in ap_with:
+            print(f"    ✓ {r['Channel Name'][:30]:<30} {_subs_int(r['Subscribers']):>9,} subs  {r['Email']}")
+    if ap_without:
+        print("  APPROVED WITHOUT EMAIL (YT button exists):")
+        for r in ap_without:
+            print(f"    ○ {r['Channel Name'][:30]:<30} {_subs_int(r['Subscribers']):>9,} subs  (manual retrieval)")
+    print()
+    if mr_with or mr_without:
+        print("  MANUAL REVIEW (top of list):")
+        combined = sorted(mr_with + mr_without,
+                          key=lambda r: (_RATING_ORDER.index(r["Rating"]),
+                                         _subs_int(r["Subscribers"])), reverse=True)
+        for r in combined[:12]:
+            e_tag = "📧" if r["Email"] else "🔘"
+            print(f"    [{r['Rating']}] {e_tag} {r['Channel Name'][:26]:<26} {_subs_int(r['Subscribers']):>9,}  "
+                  f"{r.get('Confidence',''):<7} {r['Notes'][:55]}")
+
+    return ap_with, ap_without, mr_with, mr_without
 
 # ══════════════════════════════════════════════════════════════════════════════
 # MAIN
@@ -3394,12 +3421,12 @@ if __name__ == "__main__":
 
     if args.from_stage <= 4:
         run_stage4(stage3_rows)                 # ICP scoring (internal artifact)
-    approved, review = build_outreach_sheets(stage3_rows)   # final two-sheet output
+    ap_w, ap_wo, mr_w, mr_wo = build_outreach_sheets(stage3_rows)
 
     elapsed = (time.time()-t0)/60
     print(f"\n{'═'*70}")
     print(f"Pipeline complete in {elapsed:.1f} min")
     print(f"  {STAGE3_CSV} — creator profiles (full detail)")
-    print(f"  {APPROVED_CSV} — {len(approved)} ready for outreach")
-    print(f"  {MANUAL_REVIEW_CSV} — {len(review)} need a human look")
+    print(f"  APPROVED:  {len(ap_w)} with email, {len(ap_wo)} without (YT button)")
+    print(f"  REVIEW:    {len(mr_w)} with email, {len(mr_wo)} without (YT button)")
     print(f"{'═'*70}")
