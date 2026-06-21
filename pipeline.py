@@ -311,6 +311,204 @@ CORPORATE_WE = ["we give ","we help ","we offer ","we provide ","we teach ",
                 "we are a ","we are an ","our mission is","our team ","our company"]
 
 # ══════════════════════════════════════════════════════════════════════════════
+# NAVIGATION PRIORITY — human-mimicking link scoring
+# ══════════════════════════════════════════════════════════════════════════════
+# Priority 1 = highest monetization signal. Links are sorted by this score
+# before being inserted into the crawl queue so we always visit Store/Programs
+# pages before About/Contact pages, mirroring how a human reviewer navigates.
+
+_NAV_PRIORITY_TIERS: list[tuple[int, list[str]]] = [
+    (1,  ["store", "shop", "buy", "products", "merch", "merchandise"]),
+    (2,  ["program", "programmes", "programs", "curriculum"]),
+    (3,  ["membership", "members", "member", "subscribe", "subscription"]),
+    (4,  ["community", "group", "circle", "skool", "forum"]),
+    (5,  ["course", "courses", "academy", "learn", "education", "training"]),
+    (6,  ["coaching", "work with me", "work-with-me", "hire me",
+           "1:1", "1-on-1", "one on one", "one-on-one", "apply",
+           "services", "service"]),
+    (7,  ["pricing", "prices", "price", "investment", "plans", "rates",
+           "packages", "package"]),
+    (8,  ["join", "get started", "start here", "enroll"]),
+    (9,  ["contact", "contact us", "get in touch"]),
+]
+
+def _nav_link_priority(link_text: str, href: str) -> int:
+    """
+    Return a nav priority score for a link (lower = higher priority).
+    Checks link text first, then URL path.
+    Returns 99 if no monetization signal found.
+    """
+    combined = (link_text + " " + (href or "")).lower()
+    for score, keywords in _NAV_PRIORITY_TIERS:
+        if any(kw in combined for kw in keywords):
+            return score
+    return 99
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE CONTENT TYPE — what kind of page are we on?
+# ══════════════════════════════════════════════════════════════════════════════
+# Separate from detect_page_type() (which uses domain/platform recognition).
+# This classifies the CONTENT PURPOSE of any page — store, pricing, coaching,
+# homepage, etc. — so we can apply the right extraction strategy.
+
+_CONTENT_TYPE_URL = {
+    "store":     ["/store", "/shop", "/products", "/merch", "/collections",
+                  "/merchandise", "/buy"],
+    "programs":  ["/programs", "/programme", "/curriculum", "/courses",
+                  "/course", "/training", "/academy", "/education"],
+    "membership":["/membership", "/members", "/member", "/subscribe",
+                  "/subscription"],
+    "community": ["/community", "/group", "/circle", "/skool", "/forum"],
+    "coaching":  ["/coaching", "/work-with-me", "/apply", "/services",
+                  "/hire", "/1-on-1", "/one-on-one", "/strategy",
+                  "/work-with", "/consult"],
+    "pricing":   ["/pricing", "/plans", "/investment", "/rates", "/packages",
+                  "/price"],
+    "contact":   ["/contact", "/get-in-touch", "/reach-out"],
+}
+_CONTENT_TYPE_TEXT = {
+    "store":     ["add to cart", "add to bag", "buy now", "out of stock",
+                  "in stock", "free shipping", "shop now", "view cart"],
+    "pricing":   ["per month", "per year", "/month", "/year", "billed annually",
+                  "most popular plan", "choose a plan", "cancel anytime",
+                  "money-back guarantee", "free trial"],
+    "coaching":  ["apply now", "book a call", "strategy call", "discovery call",
+                  "work with me", "limited spots", "1:1 coaching",
+                  "apply to work"],
+    "community": ["join the community", "join our community", "monthly membership",
+                  "be part of", "members only"],
+    "checkout":  ["checkout", "order summary", "payment information",
+                  "credit card", "billing address", "place order"],
+}
+
+def classify_page_content_type(url: str, title: str, text: str) -> str:
+    """
+    Identify what type of page we're on to guide extraction strategy.
+    Returns one of: store | programs | membership | community | coaching |
+                    pricing | contact | checkout | linktree | homepage
+    """
+    url_low = (url or "").lower()
+
+    # Platform-specific overrides (already known from domain)
+    for fragment in ["linktree.com", "linktr.ee", "beacons.ai", "stan.store",
+                     "bio.link", "allmylinks", "campsite.bio", "lnk.bio"]:
+        if fragment in url_low:
+            return "linktree"
+
+    # URL path signals (highest confidence — creator chose the path name)
+    for ctype, signals in _CONTENT_TYPE_URL.items():
+        if any(s in url_low for s in signals):
+            return ctype
+
+    # DOM text signals (require 2+ hits to avoid false positives)
+    text_low = (text or "")[:3000].lower()
+    for ctype, signals in _CONTENT_TYPE_TEXT.items():
+        if sum(1 for s in signals if s in text_low) >= 2:
+            return ctype
+
+    # Title-based single-hit fallback
+    title_low = (title or "").lower()
+    for ctype, signals in _CONTENT_TYPE_URL.items():
+        for s in signals:
+            if s.lstrip("/") and s.lstrip("/") in title_low:
+                return ctype
+
+    return "homepage"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STRUCTURED PRODUCT EXTRACTION — for store / pricing pages
+# ══════════════════════════════════════════════════════════════════════════════
+# Instead of raw keyword matching on a blob, we extract individual products
+# with a title, price, and category. This is what a human does when they open
+# a store page: scan each item and immediately know "study guide PDF = digital
+# product", "baseball cap = physical product", etc.
+
+_PRODUCT_CATEGORIES: list[tuple[str, list[str]]] = [
+    ("Digital Product", ["pdf", "download", "downloadable", "ebook", "e-book",
+                         "guide", "template", "worksheet", "study guide",
+                         "cheat sheet", "checklist", "video", "recording",
+                         "audio", "mp3", "bundle"]),
+    ("Course",          ["course", "program", "training", "curriculum",
+                         "bootcamp", "masterclass", "workshop", "class",
+                         "cohort", "challenge", "live training"]),
+    ("Membership",      ["membership", "subscription", "monthly", "annual",
+                         "community access", "member access", "join"]),
+    ("Coaching",        ["coaching", "mentorship", "1:1", "session",
+                         "consultation", "call", "strategy", "done with you"]),
+    ("Physical Product",["shirt", "tee", "t-shirt", "hat", "cap", "hoodie",
+                         "mug", "bottle", "apparel", "gear", "supplement",
+                         "protein", "pill", "capsule", "powder", "cream",
+                         "collagen", "vitamin", "preworkout", "pre-workout"]),
+    ("Software",        ["app", "software", "tool", "plugin", "saas",
+                         "platform", "extension", "chrome", "dashboard"]),
+    ("Service",         ["service", "done for you", "dfy", "audit", "review",
+                         "setup", "management", "consulting"]),
+]
+
+def _classify_product(text: str) -> str:
+    t = text.lower()
+    for cat, keywords in _PRODUCT_CATEGORIES:
+        if any(kw in t for kw in keywords):
+            return cat
+    return "Unknown"
+
+def extract_structured_products(page_text: str, page_title: str = "") -> list[dict]:
+    """
+    Parse a store/pricing page into a list of structured product dicts:
+      {title, price, category, raw}
+
+    Strategy: find every price in the text, look at the 3 lines above/below
+    for a product name, classify the category from the combined context.
+    Deduplicates by (price, category) to avoid counting the same item twice.
+    """
+    lines = (page_text or "").split("\n")
+    products = []
+
+    for i, line in enumerate(lines):
+        m = PRICE_RE.search(line)
+        if not m:
+            continue
+        try:
+            price_val = int(m.group(1).replace(",", ""))
+        except ValueError:
+            continue
+        if not (1 <= price_val <= 10_000):
+            continue
+
+        # Context window: 3 lines above + current + 3 below
+        ctx_lines = lines[max(0, i - 3): i + 4]
+        context   = " ".join(l.strip() for l in ctx_lines if l.strip())
+
+        # Best title candidate: longest non-price line in window
+        title_candidates = [
+            l.strip() for l in ctx_lines
+            if l.strip() and not PRICE_RE.search(l) and len(l.strip()) > 4
+        ]
+        product_title = (max(title_candidates, key=len)
+                         if title_candidates else context[:60])
+
+        category = _classify_product(context)
+        products.append({
+            "title":    product_title[:120],
+            "price":    price_val,
+            "category": category,
+            "raw":      context[:250],
+        })
+
+    # Deduplicate by (price, category)
+    seen: set = set()
+    deduped = []
+    for p in products:
+        key = (p["price"], p["category"])
+        if key not in seen:
+            seen.add(key)
+            deduped.append(p)
+    return deduped
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # PAGE-TYPE DETECTION
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1240,19 +1438,82 @@ def compute_ht_score(labels_equiv, page_titles, page_texts, urls, confidence):
     return score, hits, level
 
 
-def _detect_page_tier(page_title, page_text, url):
+def _detect_page_tier(page_title, page_text, url,
+                       content_type: str = "",
+                       structured_products: list | None = None):
     """
     Classify a single crawled page into the highest monetization tier it represents.
     Returns (tier_rank, label, price_or_None).
+
+    When structured_products is provided (from extract_structured_products on a
+    store/pricing page), we trust that data over raw blob keyword matching.
+    Store/pricing page signals are promoted automatically — a human who opens a
+    store page and sees products with prices immediately knows it's monetized.
     """
     blob   = (page_title + " " + page_text + " " + url).lower()
-    prices = extract_prices(page_title + " " + page_text)
 
-    # High ticket — only on sales STRUCTURE or a $2,000+ offer, not on a bare label
+    # High ticket — structural signals always take precedence regardless of source.
+    # Check this first so a store page that also has a strategy-call section gets
+    # correctly flagged (rare but possible).
     level, reasons = assess_ht_level(blob)
     if level == "High":
         label = reasons[0].split(": '")[0].strip().title() if reasons else "High-Ticket Offer"
+        prices = extract_prices(page_title + " " + page_text)
         return TIER_HIGH_TICKET, label, (max(prices) if prices else None)
+
+    # ── Structured product path (store / pricing / programs pages) ────────────
+    # If we extracted individual products with explicit titles, prices, and
+    # categories, use those directly instead of guessing from the raw blob.
+    # This eliminates the "study guide PDF → coaching offer" misclassification.
+    if structured_products:
+        # Determine the highest-value category present
+        cat_priority = [
+            "Coaching", "Course", "Membership", "Software",
+            "Service", "Digital Product", "Physical Product", "Unknown",
+        ]
+        present_cats = {p["category"] for p in structured_products}
+        prices_by_cat: dict[str, list] = {}
+        for p in structured_products:
+            prices_by_cat.setdefault(p["category"], []).append(p["price"])
+
+        for cat in cat_priority:
+            if cat not in present_cats:
+                continue
+            cat_prices = prices_by_cat[cat]
+            best_price = max(cat_prices) if cat_prices else None
+            if cat == "Coaching":
+                tier, _ = _paid_tier_from_price(cat_prices)
+                return tier, "Coaching/Mentorship", best_price
+            elif cat == "Course":
+                tier, _ = _paid_tier_from_price(cat_prices)
+                return tier, "Course/Digital Product", best_price
+            elif cat == "Membership":
+                tier, _ = _paid_tier_from_price(cat_prices)
+                return tier, "Membership", best_price
+            elif cat == "Software":
+                tier, _ = _paid_tier_from_price(cat_prices)
+                return tier, "Software/App", best_price
+            elif cat == "Service":
+                tier, _ = _paid_tier_from_price(cat_prices)
+                return tier, "Service", best_price
+            elif cat == "Digital Product":
+                tier, _ = _paid_tier_from_price(cat_prices)
+                return tier, "Digital Product", best_price
+            elif cat == "Physical Product":
+                # Physical products don't count as a coaching/offer endpoint —
+                # merch/supplements are a monetization signal but not a qualifier.
+                # Return a low-tier signal so the creator still registers as
+                # monetized without appearing to have a coaching product.
+                return TIER_LOW_TICKET, "Physical Product / Merch", best_price
+            elif cat == "Unknown":
+                tier, _ = _paid_tier_from_price(cat_prices)
+                return tier, "Paid Offer (unclassified)", best_price
+
+        # Structured products present but all Physical — still monetized
+        return TIER_LOW_TICKET, "Physical Product / Merch", None
+
+    # ── Raw text fallback (homepage, blog posts, linktree pages) ─────────────
+    prices = extract_prices(page_title + " " + page_text)
 
     # Community / membership / subscription endpoint
     if any(k in blob for k in COMMUNITY_ENDPOINT_KEYWORDS):
@@ -1260,8 +1521,7 @@ def _detect_page_tier(page_title, page_text, url):
         return tier, ("Membership" if ("membership" in blob or "subscription" in blob)
                       else "Community"), price
 
-    # Priced coaching / mentorship / group coaching / program / cohort (NOT
-    # high-ticket — already cleared the HT check above) → low/mid ticket
+    # Priced coaching / mentorship / group coaching / program / cohort
     if any(k in blob for k in ["coaching", "coach with me", "group coaching",
                                "mentorship", "mentoring", "cohort", "program"]):
         tier, price = _paid_tier_from_price(prices)
@@ -1412,17 +1672,33 @@ def analyze_funnel_depth(rows, ht_level, creator_name="", own_domains=None, seed
         ow_tiers.append(ow_tier)
         ow_confs.append(ow_conf)
 
-        tier, label, price = _detect_page_tier(title, text, url)
+        content_type_field   = row.get("Content Type", "") or ""
+        structured_products  = row.get("Structured Products") or []
+        tier, label, price = _detect_page_tier(
+            title, text, url,
+            content_type=content_type_field,
+            structured_products=structured_products,
+        )
+
+        # Monetization-focused pages (store, pricing, programs) carry higher
+        # evidentiary weight than homepage copy. If we navigated to a dedicated
+        # store or pricing page and found structured products, those prices are
+        # likely correct — a homepage that mentions "$49" in passing is much
+        # less reliable than a store page with an "Add to Cart" button next to it.
+        _HIGH_SIGNAL_CONTENT_TYPES = {"store", "pricing", "programs",
+                                       "membership", "community", "coaching"}
+        is_monetization_page = content_type_field in _HIGH_SIGNAL_CONTENT_TYPES
+        has_structured        = bool(structured_products)
 
         # Non-creator-asset pages: detect CATEGORY (does monetization exist?)
         # but strip PRICE (don't attribute a specific number to the creator).
-        # Partner Brand / Affiliate pages note the URL for audit but still count
-        # toward "buyers exist" — a creator selling supplements through a partner
-        # brand still has a monetized audience.
+        # Exception: if we deliberately navigated to a store/pricing page AND
+        # found structured products, trust the price — the page exists to sell
+        # something, and the creator linked to it from their bio.
         if ow_tier in ("Partner Brand", "Affiliate Offer") and ow_conf in ("High", "Medium"):
             partner_pages.append(url)
             price = None  # no price attribution, but tier category still counts
-        elif ow_tier == "Unknown" or ow_conf == "Low":
+        elif (ow_tier == "Unknown" or ow_conf == "Low") and not (is_monetization_page and has_structured):
             price = None  # category counts, price stripped until ownership confirmed
 
         if tier == TIER_LEAD_MAGNET:
@@ -2518,16 +2794,19 @@ def fetch_page_and_links(pw_page, url):
         hrefs = [unwrap_yt_redirect(h) for h in hrefs]
         hrefs = list(dict.fromkeys(hrefs))
 
-        # ── Nav / CTA link extraction ─────────────────────────────────────────
-        # These bypass the path-keyword filter so we explore navigation menus
-        # and CTA buttons on creator-owned domains even when the URL path is
-        # unconventional (e.g. /online-business, /academy, /sell-with-me).
+        # ── Nav / CTA link extraction — priority-sorted ───────────────────────
+        # Extracts links from nav/header elements and CTA-text anchors.
+        # Each link is scored by _nav_link_priority() so that monetization pages
+        # (Store, Programs, Membership…) always get crawled before About/Contact.
+        # Returns a list sorted by priority score (lowest = most important first).
         try:
-            nav_raw = pw_page.eval_on_selector_all(
+            # Capture both href AND visible link text so we can score by label
+            nav_pairs = pw_page.eval_on_selector_all(
                 "nav a[href], header a[href], [class*='nav'] a[href], "
                 "[class*='menu'] a[href], [id*='nav'] a[href], "
                 "[role='navigation'] a[href], [class*='header'] a[href]",
-                "els => [...new Set(els.map(e => e.href).filter(h => h && h.startsWith('http')))]"
+                "els => els.filter(e => e.href && e.href.startsWith('http'))"
+                ".map(e => [e.href, e.innerText.trim()])"
             )
             cta_pattern = (
                 "apply now|apply here|apply|learn more|get started|get instant access|"
@@ -2537,13 +2816,27 @@ def fetch_page_and_links(pw_page, url):
                 "program|courses|community|resources|training|masterclass|download|"
                 "grab the free|free course|free training|free guide|"
                 "scale your|scale my|build my|grow my|claim your|let's|"
-                "yes i want|next step|take the|get the|join us|i'm ready|im ready"
+                "yes i want|next step|take the|get the|join us|i'm ready|im ready|"
+                "store|shop|products|membership|pricing|plans|services"
             )
-            cta_raw = pw_page.eval_on_selector_all(
+            cta_pairs = pw_page.eval_on_selector_all(
                 "a[href]",
-                f"els => els.filter(e => /{cta_pattern}/i.test(e.innerText.trim())).map(e => e.href).filter(h => h && h.startsWith('http'))"
+                f"els => els.filter(e => /{cta_pattern}/i.test(e.innerText.trim()) && e.href && e.href.startsWith('http'))"
+                ".map(e => [e.href, e.innerText.trim()])"
             )
-            nav_cta_hrefs = list(dict.fromkeys(nav_raw + cta_raw))
+            # Deduplicate by href, keeping first occurrence (nav order preserved)
+            seen_hrefs: set = set()
+            all_pairs = []
+            for pair in (nav_pairs + cta_pairs):
+                if isinstance(pair, list) and len(pair) == 2:
+                    href, link_text = pair[0], pair[1]
+                    if href not in seen_hrefs:
+                        seen_hrefs.add(href)
+                        all_pairs.append((href, link_text))
+
+            # Sort by nav priority so highest-value pages bubble to the front
+            all_pairs.sort(key=lambda p: _nav_link_priority(p[1], p[0]))
+            nav_cta_hrefs = [p[0] for p in all_pairs]
         except Exception:
             nav_cta_hrefs = []
 
@@ -2938,17 +3231,41 @@ def crawl_creator_funnel(channel_name, seed_urls, pw_page,
 
         title, text, hrefs, nav_cta_hrefs = fetch_page_and_links(pw_page, url)
         ok = "✓" if title else "✗"
-        print(f"{indent}       {ok} '{title[:55]}'  ({len(hrefs)} links found)")
+
+        # Classify what kind of page we actually landed on — used to select the
+        # right extraction strategy and to weight signals in analyze_funnel_depth.
+        content_type = classify_page_content_type(url, title, text)
+
+        # Structured product extraction for store / pricing pages.
+        # Rather than relying on raw keyword matching on a text blob, we pull
+        # each product's title, price, and category explicitly — the same mental
+        # model a human uses when they open a store page and scan the items.
+        structured_products: list[dict] = []
+        if content_type in ("store", "pricing", "programs", "membership",
+                            "community", "coaching"):
+            structured_products = extract_structured_products(text, title)
+            if structured_products:
+                cat_summary = ", ".join(
+                    f"{p['category']} (${p['price']})"
+                    for p in structured_products[:5]
+                )
+                print(f"{indent}       [{content_type.upper()}] {len(structured_products)} product(s): {cat_summary}")
+            else:
+                print(f"{indent}       [{content_type.upper()}] no priced products extracted")
+        else:
+            print(f"{indent}       {ok} '{title[:55]}'  ({len(hrefs)} links, type={content_type})")
 
         pages.append({
-            "Channel Name":    channel_name,
-            "Depth":           depth,
-            "Source":          source,
-            "Page Type":       page_type,
-            "URL":             url,
-            "Page Title":      title,
-            "Extracted Text":  text,
-            "Outbound Links":  len(hrefs),
+            "Channel Name":       channel_name,
+            "Depth":              depth,
+            "Source":             source,
+            "Page Type":          page_type,
+            "Content Type":       content_type,
+            "Structured Products": structured_products,
+            "URL":                url,
+            "Page Title":         title,
+            "Extracted Text":     text,
+            "Outbound Links":     len(hrefs),
         })
 
         # Only expand creator_domains from known funnel platform seeds, not all hrefs
@@ -3299,10 +3616,18 @@ def run_stage2(stage1_rows=None, extra_seeds=None):
             except Exception: pass
         ig_browser.close()
 
-    fields = ["Channel Name","Depth","Source","Page Type","URL",
-              "Page Title","Extracted Text","Outbound Links"]
+    # Serialize Structured Products (list of dicts) to a JSON string for CSV
+    import json as _json
+    for r in all_page_rows:
+        sp = r.get("Structured Products")
+        if isinstance(sp, list):
+            r["Structured Products"] = _json.dumps(sp) if sp else ""
+
+    fields = ["Channel Name","Depth","Source","Page Type","Content Type",
+              "URL","Page Title","Extracted Text","Outbound Links",
+              "Structured Products"]
     with open(STAGE2_CSV, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fields)
+        w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
         w.writeheader(); w.writerows(all_page_rows)
 
     # Persist per-creator IG discovery metadata for Stage 3
@@ -3352,9 +3677,21 @@ def run_stage3(stage2_rows=None):
     print("STAGE 3 — Creator classification")
     print("═"*70 + "\n")
 
+    import json as _json
     if stage2_rows is None:
         with open(STAGE2_CSV, newline="", encoding="utf-8") as f:
             stage2_rows = list(csv.DictReader(f))
+
+    # Deserialize Structured Products from JSON string back to list of dicts
+    for r in stage2_rows:
+        sp_raw = r.get("Structured Products", "") or ""
+        if sp_raw and sp_raw.startswith("["):
+            try:
+                r["Structured Products"] = _json.loads(sp_raw)
+            except Exception:
+                r["Structured Products"] = []
+        elif not isinstance(r.get("Structured Products"), list):
+            r["Structured Products"] = []
 
     # Load Stage 1 for channel metadata (URL, subs, country) since Stage 2
     # rows are crawled pages and may not carry all creator metadata.
