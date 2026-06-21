@@ -174,8 +174,8 @@ def setup_niche(niche, run_dir=None):
     global NICHE, NICHE_QUERY, OUTPUT_DIR, RUN_DIR
     global STAGE1_CSV, STAGE2_CSV, STAGE3_CSV, STAGE4_CSV, SEEN_CHANNELS_FILE
     global CAPTCHA_PENDING_CSV, INSTAGRAM_META_CSV, CRAWL_AUDIT_CSV
-    global APPROVED_WITH_EMAIL_CSV, APPROVED_WITHOUT_EMAIL_CSV
-    global MANUAL_REVIEW_WITH_EMAIL_CSV, MANUAL_REVIEW_WITHOUT_EMAIL_CSV
+    global APPROVED_WITH_CONTACT_CSV, APPROVED_WITHOUT_CONTACT_CSV
+    global MANUAL_REVIEW_WITH_CONTACT_CSV, MANUAL_REVIEW_WITHOUT_CONTACT_CSV
     global DISQUALIFIED_CSV
     if niche not in NICHE_CONFIGS:
         raise SystemExit(
@@ -203,10 +203,10 @@ def setup_niche(niche, run_dir=None):
     CRAWL_AUDIT_CSV     = os.path.join(RUN_DIR, "crawl_audit.csv")
     CAPTCHA_PENDING_CSV = os.path.join(RUN_DIR, "captcha_pending.csv")
     INSTAGRAM_META_CSV  = os.path.join(RUN_DIR, "instagram_meta.csv")
-    APPROVED_WITH_EMAIL_CSV         = os.path.join(RUN_DIR, "APPROVED_WITH_EMAIL.csv")
-    APPROVED_WITHOUT_EMAIL_CSV      = os.path.join(RUN_DIR, "APPROVED_WITHOUT_EMAIL.csv")
-    MANUAL_REVIEW_WITH_EMAIL_CSV    = os.path.join(RUN_DIR, "MANUAL_REVIEW_WITH_EMAIL.csv")
-    MANUAL_REVIEW_WITHOUT_EMAIL_CSV = os.path.join(RUN_DIR, "MANUAL_REVIEW_WITHOUT_EMAIL.csv")
+    APPROVED_WITH_CONTACT_CSV         = os.path.join(RUN_DIR, "APPROVED_WITH_CONTACT.csv")
+    APPROVED_WITHOUT_CONTACT_CSV      = os.path.join(RUN_DIR, "APPROVED_WITHOUT_CONTACT.csv")
+    MANUAL_REVIEW_WITH_CONTACT_CSV    = os.path.join(RUN_DIR, "MANUAL_REVIEW_WITH_CONTACT.csv")
+    MANUAL_REVIEW_WITHOUT_CONTACT_CSV = os.path.join(RUN_DIR, "MANUAL_REVIEW_WITHOUT_CONTACT.csv")
     DISQUALIFIED_CSV                = os.path.join(RUN_DIR, "DISQUALIFIED.csv")
     RUN_METRICS["niche"] = niche
     print(f"  Run folder: {RUN_DIR}")
@@ -4453,10 +4453,10 @@ def run_stage4(stage3_rows=None):
 # NO rejected sheet. Bias is toward MANUAL_REVIEW — we would rather hand-check 20
 # extra creators than send outreach to someone already running a mature HT backend.
 
-APPROVED_WITH_EMAIL_CSV    = os.path.join(RUN_DIR, "APPROVED_WITH_EMAIL.csv")
-APPROVED_WITHOUT_EMAIL_CSV = os.path.join(RUN_DIR, "APPROVED_WITHOUT_EMAIL.csv")
-MANUAL_REVIEW_WITH_EMAIL_CSV    = os.path.join(RUN_DIR, "MANUAL_REVIEW_WITH_EMAIL.csv")
-MANUAL_REVIEW_WITHOUT_EMAIL_CSV = os.path.join(RUN_DIR, "MANUAL_REVIEW_WITHOUT_EMAIL.csv")
+APPROVED_WITH_CONTACT_CSV    = os.path.join(RUN_DIR, "APPROVED_WITH_CONTACT.csv")
+APPROVED_WITHOUT_CONTACT_CSV = os.path.join(RUN_DIR, "APPROVED_WITHOUT_CONTACT.csv")
+MANUAL_REVIEW_WITH_CONTACT_CSV    = os.path.join(RUN_DIR, "MANUAL_REVIEW_WITH_CONTACT.csv")
+MANUAL_REVIEW_WITHOUT_CONTACT_CSV = os.path.join(RUN_DIR, "MANUAL_REVIEW_WITHOUT_CONTACT.csv")
 DISQUALIFIED_CSV                = os.path.join(RUN_DIR, "DISQUALIFIED.csv")
 
 _RATING_ORDER = ["D", "C", "B", "A", "S"]   # ascending
@@ -4622,16 +4622,15 @@ def _review_note(row):
 
 
 def _disqualification_reason(row):
-    """Human-readable reason this creator was disqualified, derived from
-    the strongest signal we have. Used for the DISQUALIFIED.csv audit trail."""
-    angle = row.get("Outreach Angle","") or ""
-    if angle_bucket(angle) == "DISQUALIFIED":
-        deepest = row.get("Deepest Monetization Layer","")
-        if deepest:
-            return f"HT backend detected: {deepest}"
-        return "HT backend detected"
-    # Not HT-disqualified — must be a no-contact-path drop
-    return "No contact path (no public email and no YouTube email button)"
+    """Human-readable reason this creator was disqualified.
+
+    DISQUALIFIED is a pure BUSINESS-MODEL bucket: only confirmed HT backends
+    land here. Contactability is a separate dimension and never disqualifies —
+    a qualified-but-unreachable creator goes to *_WITHOUT_CONTACT, not here."""
+    deepest = row.get("Deepest Monetization Layer","")
+    if deepest:
+        return f"HT backend detected: {deepest}"
+    return "HT backend detected"
 
 def build_outreach_sheets(stage3_rows=None):
     t0_stage = time.time()
@@ -4652,13 +4651,22 @@ def build_outreach_sheets(stage3_rows=None):
         email              = (row.get("Email","") or "").strip()
         yt_btn             = row.get("YT Email Button","N") == "Y"
         has_email          = bool(email)
+        # Contactable = direct email OR a YouTube email button exists. A button
+        # requires manual CAPTCHA solving but the creator IS reachable — that's
+        # an automation limit, not an outreach limit. Contactability is a
+        # SEPARATE dimension from qualification and never disqualifies.
         contactable        = has_email or yt_btn
+        contact_method     = ("Email + YT button" if has_email and yt_btn
+                              else "Email"          if has_email
+                              else "YT button only" if yt_btn
+                              else "None")
 
-        # ── DISQUALIFIED bucket — every dropped creator lands here ───────────
-        # Includes (a) HT-backend creators and (b) creators with no contact path.
-        # Nothing is silently discarded; this file is the audit trail for the
-        # qualification engine.
-        if is_ht_disqualified or not contactable:
+        # ── DISQUALIFIED bucket — BUSINESS-MODEL disqualification ONLY ────────
+        # A creator lands here only for a confirmed HT backend (application
+        # funnel, strategy/discovery call, mastermind, mentorship, $2k+ offer,
+        # etc.). A missing contact path NEVER sends a creator here — qualified
+        # but unreachable creators flow to *_WITHOUT_CONTACT and stay visible.
+        if is_ht_disqualified:
             disqualified_rows.append({
                 "Channel Name":              row.get("Channel Name",""),
                 "Subscribers":               row.get("Subscribers",""),
@@ -4681,8 +4689,10 @@ def build_outreach_sheets(stage3_rows=None):
             "Subscribers":           row.get("Subscribers",""),
             "Email":                 email,
             "Email Source":          row.get("Email Source",""),
-            "Channel Link":          row.get("Channel URL",""),
+            "Email Found":           "Y" if has_email else "N",
             "YT Email Button":       "Y" if yt_btn else "N",
+            "Contact Method":        contact_method,
+            "Channel Link":          row.get("Channel URL",""),
             "Outreach Angle":        row.get("Outreach Angle",""),
             "Last Upload Date":        row.get("Last Upload Date",""),
             "Largest Upload Gap Days": row.get("Largest Upload Gap Days",""),
@@ -4691,13 +4701,15 @@ def build_outreach_sheets(stage3_rows=None):
             "Partner Pages Noted":     row.get("Partner Pages Noted",""),
         }
 
+        # With/Without Contact split is keyed on `contactable` (email OR button),
+        # i.e. real-world outreach ability — not on whether we have a ready email.
         if _is_approved(row):
             entry = {**common,
                 "Notes": _approved_note(row),
                 "_attr": _attractiveness(row),
                 "_conf": row.get("Data Confidence",""),
             }
-            if has_email:
+            if contactable:
                 ap_with.append(entry)
             else:
                 ap_without.append(entry)
@@ -4708,7 +4720,7 @@ def build_outreach_sheets(stage3_rows=None):
                 "Notes":      _review_note(row),
                 "_attr": _attractiveness(row),
             }
-            if has_email:
+            if contactable:
                 mr_with.append(entry)
             else:
                 mr_without.append(entry)
@@ -4736,10 +4748,12 @@ def build_outreach_sheets(stage3_rows=None):
             w.writeheader(); w.writerows(data)
         return target
 
-    ap_fields = ["Channel Name","Subscribers","Email","Email Source","Channel Link",
-                 "YT Email Button","Outreach Angle","Ownership Confidence","Notes"]
-    mr_fields = ["Channel Name","Subscribers","Email","Email Source","Channel Link",
-                 "YT Email Button","Confidence","Rating","Outreach Angle","Notes",
+    ap_fields = ["Channel Name","Subscribers","Email","Email Source","Email Found",
+                 "YT Email Button","Contact Method","Channel Link",
+                 "Outreach Angle","Ownership Confidence","Notes"]
+    mr_fields = ["Channel Name","Subscribers","Email","Email Source","Email Found",
+                 "YT Email Button","Contact Method","Channel Link",
+                 "Confidence","Rating","Outreach Angle","Notes",
                  "Last Upload Date","Largest Upload Gap Days","No-Face Signal",
                  "Ownership Confidence","Partner Pages Noted"]
     dq_fields = ["Channel Name","Subscribers","Email","Email Source","Channel Link",
@@ -4754,32 +4768,35 @@ def build_outreach_sheets(stage3_rows=None):
         reverse=True,
     )
 
-    _safe_write_csv(APPROVED_WITH_EMAIL_CSV, ap_fields, ap_with)
-    _safe_write_csv(APPROVED_WITHOUT_EMAIL_CSV, ap_fields, ap_without)
-    _safe_write_csv(MANUAL_REVIEW_WITH_EMAIL_CSV, mr_fields, mr_with)
-    _safe_write_csv(MANUAL_REVIEW_WITHOUT_EMAIL_CSV, mr_fields, mr_without)
+    _safe_write_csv(APPROVED_WITH_CONTACT_CSV, ap_fields, ap_with)
+    _safe_write_csv(APPROVED_WITHOUT_CONTACT_CSV, ap_fields, ap_without)
+    _safe_write_csv(MANUAL_REVIEW_WITH_CONTACT_CSV, mr_fields, mr_with)
+    _safe_write_csv(MANUAL_REVIEW_WITHOUT_CONTACT_CSV, mr_fields, mr_without)
     _safe_write_csv(DISQUALIFIED_CSV, dq_fields, disqualified_rows)
 
     # ── Summary report ────────────────────────────────────────────────────────
     total_approved = len(ap_with) + len(ap_without)
     total_review   = len(mr_with) + len(mr_without)
     total_disq     = len(disqualified_rows)
-    dq_ht          = sum(1 for r in disqualified_rows
-                         if r["Disqualification Reason"].startswith("HT"))
-    dq_no_contact  = total_disq - dq_ht
+    # Contact-method breakdown inside the With-Contact buckets: immediately
+    # reachable (email) vs reachable only via manual YT retrieval (button only).
+    def _via_email(lst):  return sum(1 for r in lst if r.get("Email Found")=="Y")
+    def _via_button(lst): return sum(1 for r in lst if r.get("Email Found")=="N")
     rc = {}
     for ltr in _RATING_ORDER:
         rc[ltr] = sum(1 for r in mr_with + mr_without if r["Rating"]==ltr)
 
     print(f"  Creators scanned:          {len(stage3_rows)}")
-    print(f"  Disqualified:              {total_disq}  "
-          f"(HT backend: {dq_ht}, no contact path: {dq_no_contact})")
+    print(f"  Disqualified (HT backend): {total_disq}  → {DISQUALIFIED_CSV}")
     print()
-    print(f"  APPROVED with email:       {len(ap_with):>3}  → {APPROVED_WITH_EMAIL_CSV}")
-    print(f"  APPROVED without email:    {len(ap_without):>3}  → {APPROVED_WITHOUT_EMAIL_CSV}")
-    print(f"  MANUAL REVIEW with email:  {len(mr_with):>3}  → {MANUAL_REVIEW_WITH_EMAIL_CSV}")
-    print(f"  MANUAL REVIEW without:     {len(mr_without):>3}  → {MANUAL_REVIEW_WITHOUT_EMAIL_CSV}")
-    print(f"  DISQUALIFIED (audit):      {total_disq:>3}  → {DISQUALIFIED_CSV}")
+    print(f"  APPROVED With Contact:       {len(ap_with):>3}  → {APPROVED_WITH_CONTACT_CSV}")
+    print(f"       ├─ via email:           {_via_email(ap_with):>3}")
+    print(f"       └─ via YT button only:  {_via_button(ap_with):>3}")
+    print(f"  APPROVED Without Contact:    {len(ap_without):>3}  → {APPROVED_WITHOUT_CONTACT_CSV}")
+    print(f"  MANUAL REVIEW With Contact:  {len(mr_with):>3}  → {MANUAL_REVIEW_WITH_CONTACT_CSV}")
+    print(f"       ├─ via email:           {_via_email(mr_with):>3}")
+    print(f"       └─ via YT button only:  {_via_button(mr_with):>3}")
+    print(f"  MANUAL REVIEW Without Contact:{len(mr_without):>3}  → {MANUAL_REVIEW_WITHOUT_CONTACT_CSV}")
     print()
     print(f"  Total approved:  {total_approved}   Total review:  {total_review}   "
           f"Total disqualified:  {total_disq}")
@@ -4787,13 +4804,14 @@ def build_outreach_sheets(stage3_rows=None):
     print()
 
     if ap_with:
-        print("  APPROVED WITH EMAIL:")
+        print("  APPROVED WITH CONTACT:")
         for r in ap_with:
-            print(f"    ✓ {r['Channel Name'][:30]:<30} {_subs_int(r['Subscribers']):>9,} subs  {r['Email']}")
+            reach = r['Email'] if r.get("Email Found")=="Y" else "(YT button — manual retrieval)"
+            print(f"    ✓ {r['Channel Name'][:30]:<30} {_subs_int(r['Subscribers']):>9,} subs  {reach}")
     if ap_without:
-        print("  APPROVED WITHOUT EMAIL (YT button exists):")
+        print("  APPROVED WITHOUT CONTACT (qualified, no contact path — find one):")
         for r in ap_without:
-            print(f"    ○ {r['Channel Name'][:30]:<30} {_subs_int(r['Subscribers']):>9,} subs  (manual retrieval)")
+            print(f"    ○ {r['Channel Name'][:30]:<30} {_subs_int(r['Subscribers']):>9,} subs  (no email, no YT button)")
     print()
     if mr_with or mr_without:
         print("  MANUAL REVIEW (top of list):")
@@ -4878,12 +4896,12 @@ def print_funnel_report(ap_w, ap_wo, mr_w, mr_wo, disq, elapsed_sec):
     print(f"    Unique Creators Processed:   {processed}")
     print()
     print(f"  Routing")
-    print(f"    Disqualified:                {len(disq)}")
-    print(f"    Manual Review With Email:    {len(mr_w)}")
-    print(f"    Manual Review Without Email: {len(mr_wo)}")
-    print(f"    Approved With Email:         {len(ap_w)}")
-    print(f"    Approved Without Email:      {len(ap_wo)}")
-    print(f"    Total Outreach-Eligible:     {eligible}")
+    print(f"    Disqualified (HT backend):     {len(disq)}")
+    print(f"    Approved With Contact:         {len(ap_w)}")
+    print(f"    Approved Without Contact:      {len(ap_wo)}")
+    print(f"    Manual Review With Contact:    {len(mr_w)}")
+    print(f"    Manual Review Without Contact: {len(mr_wo)}")
+    print(f"    Total Non-Disqualified:        {eligible}")
     print()
     print(f"  Rates  (over {processed} processed)")
     print(f"    Approval Rate:               {_rate(len(ap_w)+len(ap_wo), processed)}")
@@ -4958,6 +4976,6 @@ if __name__ == "__main__":
     elapsed = time.time() - t0
     print_funnel_report(ap_w, ap_wo, mr_w, mr_wo, disq, elapsed)
     print(f"  {STAGE3_CSV} — creator profiles (full detail)")
-    print(f"  APPROVED:    {len(ap_w)} with email, {len(ap_wo)} without (YT button)")
-    print(f"  REVIEW:      {len(mr_w)} with email, {len(mr_wo)} without (YT button)")
-    print(f"  DISQUALIFIED: {len(disq)} (HT backend or no contact path)")
+    print(f"  APPROVED:    {len(ap_w)} with contact, {len(ap_wo)} without contact")
+    print(f"  REVIEW:      {len(mr_w)} with contact, {len(mr_wo)} without contact")
+    print(f"  DISQUALIFIED: {len(disq)} (confirmed HT backend only)")
