@@ -16,6 +16,12 @@ __pycache__/
 # Per-niche pipeline outputs (large, regenerable; one folder per niche).
 outputs/
 
+# Versioned per-run outputs (contain scraped creator emails / personal data).
+runs/
+
+# Transient run logs (pipeline stdout dumps).
+run_log_*.txt
+
 # Legacy root-level intermediate CSVs from the pre-niche-folder layout.
 stage1_links.csv
 stage2_pages.csv
