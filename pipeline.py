@@ -426,26 +426,53 @@ def classify_page_content_type(url: str, title: str, text: str) -> str:
 # product", "baseball cap = physical product", etc.
 
 _PRODUCT_CATEGORIES: list[tuple[str, list[str]]] = [
-    ("Digital Product", ["pdf", "download", "downloadable", "ebook", "e-book",
-                         "guide", "template", "worksheet", "study guide",
-                         "cheat sheet", "checklist", "video", "recording",
-                         "audio", "mp3", "bundle"]),
-    ("Course",          ["course", "program", "training", "curriculum",
-                         "bootcamp", "masterclass", "workshop", "class",
-                         "cohort", "challenge", "live training"]),
-    ("Membership",      ["membership", "subscription", "monthly", "annual",
-                         "community access", "member access", "join"]),
-    ("Coaching",        ["coaching", "mentorship", "1:1", "session",
-                         "consultation", "call", "strategy", "done with you"]),
-    ("Physical Product",["shirt", "tee", "t-shirt", "hat", "cap", "hoodie",
-                         "mug", "bottle", "apparel", "gear", "supplement",
-                         "protein", "pill", "capsule", "powder", "cream",
-                         "collagen", "vitamin", "preworkout", "pre-workout"]),
-    ("Software",        ["app", "software", "tool", "plugin", "saas",
-                         "platform", "extension", "chrome", "dashboard"]),
-    ("Service",         ["service", "done for you", "dfy", "audit", "review",
-                         "setup", "management", "consulting"]),
+    # Coaching demand — these prove someone will pay for personal attention/access
+    ("Coaching",          ["coaching", "1:1", "one on one", "one-on-one",
+                           "done with you", "private coaching", "personal coaching"]),
+    ("Mentorship",        ["mentorship", "mentoring", "mentor program",
+                           "mentorship program"]),
+    ("Application Funnel",["apply now", "apply here", "application", "apply to",
+                           "book a call", "strategy call", "discovery call",
+                           "free call", "book your call", "book a strategy"]),
+    ("Course",            ["course", "training program", "curriculum",
+                           "bootcamp", "masterclass", "workshop", "cohort",
+                           "live training", "challenge"]),
+    ("Community",         ["community", "group", "circle", "skool", "tribe",
+                           "inner circle", "private group", "online community"]),
+    ("Membership",        ["membership", "subscription", "monthly access",
+                           "annual access", "member access", "members area",
+                           "join the", "founding member"]),
+    # Buyer demand only — proves monetized audience but NOT coaching demand
+    ("Software",          ["app", "software", "tool", "plugin", "saas",
+                           "platform", "extension", "chrome extension",
+                           "dashboard", "calculator"]),
+    ("Supplement",        ["supplement", "protein", "pill", "capsule", "powder",
+                           "collagen", "vitamin", "preworkout", "pre-workout",
+                           "creatine", "omega", "greens", "formula", "blend",
+                           "peptide", "hormone", "hrt", "testosterone",
+                           "fat burner", "nootropic"]),
+    ("Physical Product",  ["shirt", "tee", "t-shirt", "hat", "cap", "hoodie",
+                           "mug", "bottle", "apparel", "gear", "merch",
+                           "merchandise", "clothing", "shorts", "jacket"]),
+    ("Digital Product",   ["pdf", "download", "downloadable", "ebook", "e-book",
+                           "guide", "template", "worksheet", "study guide",
+                           "cheat sheet", "checklist", "video recording",
+                           "audio", "mp3", "bundle", "swipe file"]),
+    ("Service",           ["service", "done for you", "dfy", "audit", "review",
+                           "setup", "management", "consulting", "agency"]),
 ]
+
+# Categories that prove the audience will pay for personal attention / access.
+# These are what we're pitching INTO (adding a HT layer on top of these).
+COACHING_DEMAND_CATEGORIES = {
+    "Coaching", "Mentorship", "Application Funnel", "Course",
+    "Community", "Membership",
+}
+# Categories that prove buyer demand but don't indicate coaching demand.
+# Useful as supporting signals but not sufficient on their own for outreach.
+BUYER_ONLY_CATEGORIES = {
+    "Software", "Supplement", "Physical Product", "Digital Product", "Service",
+}
 
 def _classify_product(text: str) -> str:
     t = text.lower()
@@ -685,49 +712,100 @@ def get_latest_upload(playlist_id):
 
 
 def get_upload_cadence(playlist_id):
-    """Fetch the 3 most recent upload dates and return (latest_date, max_gap_days, latest_video_id).
+    """Fetch the 3 most recent upload dates and return
+    (latest_date, max_gap_days, top3_video_ids).
 
-    max_gap_days is the largest gap between any two consecutive uploads.
-    Returns (None, None, None) if no uploads found.
+    max_gap_days is the largest gap between consecutive uploads.
+    top3_video_ids is a list of up to 3 video IDs ordered newest-first.
+    Returns (None, None, []) if no uploads found.
     """
     resp = youtube.playlistItems().list(
         part="contentDetails", playlistId=playlist_id, maxResults=3
     ).execute()
     items = resp.get("items", [])
-    dates = []
-    latest_video_id = None
-    for i, it in enumerate(items):
-        ts = it["contentDetails"].get("videoPublishedAt")
+    dates      = []
+    video_ids  = []
+    for it in items:
+        ts  = it["contentDetails"].get("videoPublishedAt")
         vid = it["contentDetails"].get("videoId")
-        if ts:
+        if ts and vid:
             try:
                 dates.append(datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc))
-                if i == 0:
-                    latest_video_id = vid
+                video_ids.append(vid)
             except Exception:
                 pass
     if not dates:
-        return None, None, None
+        return None, None, []
     latest = max(dates)
     if len(dates) < 2:
-        return latest, None, latest_video_id
+        return latest, None, video_ids
     dates_sorted = sorted(dates, reverse=True)
     max_gap = max((dates_sorted[i] - dates_sorted[i+1]).days for i in range(len(dates_sorted)-1))
-    return latest, max_gap, latest_video_id
+    return latest, max_gap, video_ids
 
 
-def get_latest_video_description(video_id):
-    """Return the description of a specific video, or '' on failure."""
-    if not video_id:
-        return ""
+# URL patterns that signal monetization content inside a video description.
+# These are the links creators embed for their audience — booking pages,
+# community links, coaching applications, course pages, etc.
+_VIDEO_DESC_MONETIZATION_DOMAINS = [
+    "calendly.com", "cal.com", "tidycal.com", "acuityscheduling.com",
+    "skool.com", "circle.so", "whop.com", "kajabi.com", "teachable.com",
+    "thinkific.com", "podia.com", "gumroad.com", "payhip.com",
+    "typeform.com", "jotform.com", "tally.so",
+    "clickfunnels.com", "kartra.com", "systeme.io", "stan.store",
+    "beacons.ai", "linktr.ee", "linktree.com",
+    "apply.", "/apply", "/coaching", "/work-with-me", "/programs",
+    "/community", "/membership", "/course", "/courses", "/services",
+    "/pricing", "/join", "/academy",
+]
+_VIDEO_DESC_URL_RE = re.compile(r"https?://[^\s<>\"'\)\]]+", re.I)
+
+def get_video_description_signals(video_ids: list) -> dict:
+    """
+    Fetch descriptions for up to 3 video IDs in a single API call.
+    Returns:
+      emails   : list of email strings found across all descriptions
+      seed_urls: list of monetization-signal URLs to add as crawl seeds
+      raw_urls : all URLs found (for audit)
+    """
+    if not video_ids:
+        return {"emails": [], "seed_urls": [], "raw_urls": []}
+    ids_param = ",".join(video_ids[:3])
     try:
-        resp = youtube.videos().list(part="snippet", id=video_id).execute()
-        items = resp.get("items", [])
-        if items:
-            return items[0]["snippet"].get("description", "")
+        resp = youtube.videos().list(part="snippet", id=ids_param).execute()
     except Exception:
-        pass
-    return ""
+        return {"emails": [], "seed_urls": [], "raw_urls": []}
+
+    all_emails:    list = []
+    all_seed_urls: list = []
+    all_raw_urls:  list = []
+
+    for item in resp.get("items", []):
+        desc = item["snippet"].get("description", "") or ""
+
+        # Extract emails
+        for em in extract_emails(desc):
+            if em not in all_emails:
+                all_emails.append(em)
+
+        # Extract URLs and filter for monetization signals
+        for url_match in _VIDEO_DESC_URL_RE.finditer(desc):
+            raw_url = url_match.group(0).rstrip(".,;:)")
+            if raw_url not in all_raw_urls:
+                all_raw_urls.append(raw_url)
+            url_low = raw_url.lower()
+            # Skip social media — already handled by IG discovery
+            if any(s in url_low for s in SOCIAL_SKIP_DOMAINS):
+                continue
+            is_monetization = any(sig in url_low for sig in _VIDEO_DESC_MONETIZATION_DOMAINS)
+            if is_monetization and raw_url not in all_seed_urls:
+                all_seed_urls.append(raw_url)
+
+    return {
+        "emails":    all_emails,
+        "seed_urls": all_seed_urls,
+        "raw_urls":  all_raw_urls,
+    }
 
 # ══════════════════════════════════════════════════════════════════════════════
 # FILTERS
@@ -1464,12 +1542,16 @@ def _detect_page_tier(page_title, page_text, url,
     # ── Structured product path (store / pricing / programs pages) ────────────
     # If we extracted individual products with explicit titles, prices, and
     # categories, use those directly instead of guessing from the raw blob.
-    # This eliminates the "study guide PDF → coaching offer" misclassification.
+    # Priority order: coaching-demand categories first, then buyer-only.
     if structured_products:
-        # Determine the highest-value category present
         cat_priority = [
-            "Coaching", "Course", "Membership", "Software",
-            "Service", "Digital Product", "Physical Product", "Unknown",
+            # Coaching demand (what we're pitching INTO)
+            "Application Funnel", "Coaching", "Mentorship",
+            "Course", "Community", "Membership",
+            # Buyer demand (monetized audience, not coaching-specific)
+            "Software", "Service", "Digital Product",
+            "Supplement", "Physical Product",
+            "Unknown",
         ]
         present_cats = {p["category"] for p in structured_products}
         prices_by_cat: dict[str, list] = {}
@@ -1481,35 +1563,31 @@ def _detect_page_tier(page_title, page_text, url,
                 continue
             cat_prices = prices_by_cat[cat]
             best_price = max(cat_prices) if cat_prices else None
-            if cat == "Coaching":
+
+            if cat == "Application Funnel":
+                return TIER_HIGH_TICKET, "Application Funnel", best_price
+            elif cat in ("Coaching", "Mentorship"):
                 tier, _ = _paid_tier_from_price(cat_prices)
-                return tier, "Coaching/Mentorship", best_price
-            elif cat == "Course":
+                return tier, cat, best_price
+            elif cat in ("Course", "Community", "Membership"):
                 tier, _ = _paid_tier_from_price(cat_prices)
-                return tier, "Course/Digital Product", best_price
-            elif cat == "Membership":
+                return tier, cat, best_price
+            elif cat in ("Software", "Service"):
                 tier, _ = _paid_tier_from_price(cat_prices)
-                return tier, "Membership", best_price
-            elif cat == "Software":
-                tier, _ = _paid_tier_from_price(cat_prices)
-                return tier, "Software/App", best_price
-            elif cat == "Service":
-                tier, _ = _paid_tier_from_price(cat_prices)
-                return tier, "Service", best_price
+                return tier, cat, best_price
             elif cat == "Digital Product":
                 tier, _ = _paid_tier_from_price(cat_prices)
                 return tier, "Digital Product", best_price
-            elif cat == "Physical Product":
-                # Physical products don't count as a coaching/offer endpoint —
-                # merch/supplements are a monetization signal but not a qualifier.
-                # Return a low-tier signal so the creator still registers as
-                # monetized without appearing to have a coaching product.
-                return TIER_LOW_TICKET, "Physical Product / Merch", best_price
+            elif cat in ("Supplement", "Physical Product"):
+                # Buyer-demand only — audience buys things, but not coaching.
+                # Still registers as monetized (TIER_LOW_TICKET) so the creator
+                # qualifies for outreach, but labeled clearly so the angle
+                # generator can distinguish "buyers exist" from "coaching demand".
+                return TIER_LOW_TICKET, cat, best_price
             elif cat == "Unknown":
                 tier, _ = _paid_tier_from_price(cat_prices)
                 return tier, "Paid Offer (unclassified)", best_price
 
-        # Structured products present but all Physical — still monetized
         return TIER_LOW_TICKET, "Physical Product / Merch", None
 
     # ── Raw text fallback (homepage, blog posts, linktree pages) ─────────────
@@ -2020,32 +2098,41 @@ def classify_creator(channel_name, rows, own_domains=None, seed_labels=None):
     # to qualify a lead. Specifics stay in the internal audit trail only.
     top_signals = "; ".join(ht_signals_found[:2])
 
-    def _category_list():
-        """Deduplicated human-readable monetization categories from detected assets."""
-        cats = []
-        for a in (mono or []):
-            a_low = a.lower()
-            if "course" in a_low or "program" in a_low:
-                cats.append("course/program")
-            elif "community" in a_low or "membership" in a_low:
-                cats.append("community/membership")
-            elif "supplement" in a_low or "product" in a_low or "shop" in a_low:
-                cats.append("products/supplements")
-            elif "service" in a_low or "coaching" in a_low:
-                cats.append("coaching/services")
-            elif "software" in a_low or "app" in a_low or "saas" in a_low:
-                cats.append("software/app")
-            elif "book" in a_low or "ebook" in a_low:
-                cats.append("book/content")
-            elif "lead" in a_low or "magnet" in a_low or "free" in a_low:
-                cats.append("lead capture")
-            else:
-                cats.append(a_low)
-        seen = []
-        for c in cats:
-            if c not in seen:
-                seen.append(c)
-        return seen
+    # Separate detected assets into coaching-demand vs buyer-only buckets.
+    # Also collect structured product categories from page detections.
+    structured_labels = []
+    for r in rows:
+        sp = r.get("Structured Products") or []
+        if isinstance(sp, list):
+            for p in sp:
+                c = p.get("category","")
+                if c and c not in structured_labels:
+                    structured_labels.append(c)
+
+    coaching_demand_labels = [
+        c for c in (mono + structured_labels)
+        if any(cd.lower() in c.lower() for cd in COACHING_DEMAND_CATEGORIES)
+    ]
+    buyer_only_labels = [
+        c for c in structured_labels
+        if any(bo.lower() in c.lower() for bo in BUYER_ONLY_CATEGORIES)
+        and not any(cd.lower() in c.lower() for cd in COACHING_DEMAND_CATEGORIES)
+    ]
+    # Deduplicate
+    coaching_demand_labels = list(dict.fromkeys(coaching_demand_labels))
+    buyer_only_labels      = list(dict.fromkeys(buyer_only_labels))
+
+    has_coaching_demand = bool(coaching_demand_labels)
+    has_buyer_only      = bool(buyer_only_labels) and not has_coaching_demand
+
+    def _cats_str(label_list):
+        """Compact readable string of category labels."""
+        clean = []
+        for c in label_list[:5]:
+            c = c.lower().replace("physical product", "merch/physical")
+            if c not in clean:
+                clean.append(c)
+        return ", ".join(clean) if clean else "multiple offer types"
 
     if highest_tier == TIER_HIGH_TICKET:
         angle = (f"DISQUALIFY — funnel ends in HT ({fd['deepest_layer']}). "
@@ -2057,9 +2144,14 @@ def classify_creator(channel_name, rows, own_domains=None, seed_labels=None):
                  f"we cannot see past; HT backend NOT ruled out. Manual review required. "
                  f"Path so far: {fd['funnel_path']}")
     elif highest_tier in (TIER_LOW_TICKET, TIER_MID_TICKET):
-        cats = _category_list()
-        cats_str = ", ".join(cats) if cats else "multiple offer types"
-        if fragmented:
+        if has_buyer_only and not has_coaching_demand:
+            # Audience buys things but no coaching-specific demand detected.
+            # Still a valid outreach target — pitch the first coaching offer.
+            cats_str = _cats_str(buyer_only_labels)
+            angle = (f"QUALIFIED (buyer demand) — monetized audience confirmed "
+                     f"({cats_str}); no coaching or course backend detected. "
+                     f"Pitch first coaching/mentorship offer.")
+        elif fragmented:
             if ownership_confidence == "High":
                 assets_str = ", ".join(mono[:5])
                 price_str  = ("/".join(f"${p}" for p in distinct_prices[:4])
@@ -2071,10 +2163,11 @@ def classify_creator(channel_name, rows, own_domains=None, seed_labels=None):
                          f"layer {fd['deepest_layer']}, no HT backend (endpoint conf "
                          f"{ep['endpoint_confidence']}). Path: {fd['funnel_path']}")
             else:
+                cats_str = _cats_str(coaching_demand_labels or buyer_only_labels)
                 angle = (f"QUALIFIED (consolidation play) — multiple monetized offer "
-                         f"categories detected ({cats_str}); audience clearly buys across "
-                         f"several channels. No single HT home — pitch consolidating under "
-                         f"one premium service. No HT backend found (endpoint conf "
+                         f"categories detected ({cats_str}); audience clearly buys. "
+                         f"No single HT home — pitch consolidating under one premium "
+                         f"service. No HT backend found (endpoint conf "
                          f"{ep['endpoint_confidence']}).")
         else:
             if ownership_confidence == "High":
@@ -2083,6 +2176,7 @@ def classify_creator(channel_name, rows, own_domains=None, seed_labels=None):
                          f"{ep['endpoint_confidence']}). Path: {fd['funnel_path']} "
                          f"— pitch HT ascension offer")
             else:
+                cats_str = _cats_str(coaching_demand_labels or buyer_only_labels)
                 angle = (f"QUALIFIED — monetized audience confirmed "
                          f"({cats_str} detected); no HT backend found. "
                          f"Pitch HT ascension offer.")
@@ -2235,13 +2329,13 @@ def run_stage1():
             if d["subs"] < MIN_SUBS:
                 counts["subs"] += 1
                 continue
-            latest, max_gap_days, latest_vid_id = get_upload_cadence(d["uploads"])
+            latest, max_gap_days, top_video_ids = get_upload_cadence(d["uploads"])
             if not latest or latest < cutoff:
                 counts["inactive"] += 1
                 continue
-            d["last_upload"]      = latest.strftime("%Y-%m-%d")
-            d["max_gap_days"]     = max_gap_days  # None if only 1 upload found
-            d["latest_video_id"]  = latest_vid_id
+            d["last_upload"]     = latest.strftime("%Y-%m-%d")
+            d["max_gap_days"]    = max_gap_days  # None if only 1 upload found
+            d["top_video_ids"]   = top_video_ids  # list of up to 3 newest video IDs
             if not passes_personal_brand(d["title"], d["description"]):
                 counts["company"] += 1
                 print(f"  skip [company]      {d['title']}")
@@ -2299,16 +2393,28 @@ def run_stage1():
 
         for ch in surviving:
             print(f"\n  → {ch['title']}")
-            links = extract_about_links(page, ch["about_url"], ch["title"])
+            links        = extract_about_links(page, ch["about_url"], ch["title"])
             yt_email_btn = "Y" if check_yt_email_button(page, ch["url"]) else "N"
-            vid_desc  = get_latest_video_description(ch.get("latest_video_id"))
-            vid_email = extract_emails(vid_desc)[0] if vid_desc and extract_emails(vid_desc) else ""
+
+            # Fetch signals from latest 3 video descriptions — first-class data source.
+            # Creators embed booking links, Skool, Calendly, coaching pages, emails here
+            # with the same intent as their bio links.
+            vid_signals   = get_video_description_signals(ch.get("top_video_ids", []))
+            vid_email     = vid_signals["emails"][0] if vid_signals["emails"] else ""
+            vid_seed_urls = vid_signals["seed_urls"]  # fed into Stage 2 as crawl seeds
+            if vid_seed_urls:
+                print(f"     video desc: {len(vid_seed_urls)} monetization link(s) found")
+            if vid_email:
+                print(f"     video desc email: {vid_email}")
+
             cadence_base = {
                 "Last Upload Date":        ch.get("last_upload", ""),
                 "Largest Upload Gap Days": ch.get("max_gap_days", ""),
                 "No-Face Signal":          ch.get("no_face_signal", ""),
                 "Latest Video Email":      vid_email,
             }
+
+            # About-page links (primary seeds)
             if links:
                 for lk in links:
                     rows.append({
@@ -2320,6 +2426,7 @@ def run_stage1():
                         "Destination URL": lk["url"],
                         "Page Type":       detect_page_type(lk["url"]),
                         "YT Email Button": yt_email_btn,
+                        "Source":          "about_page",
                         **cadence_base,
                     })
             else:
@@ -2332,16 +2439,33 @@ def run_stage1():
                     "Destination URL": "",
                     "Page Type":       "",
                     "YT Email Button": yt_email_btn,
+                    "Source":          "about_page",
                     **cadence_base,
                 })
+
+            # Video-description seeds (treated equally to About links for crawling)
+            for vurl in vid_seed_urls:
+                rows.append({
+                    "Channel Name":    ch["title"],
+                    "Channel URL":     ch["url"],
+                    "Subscribers":     ch["subs"],
+                    "Country":         ch["country"] or "unknown",
+                    "Link Label":      "video description link",
+                    "Destination URL": vurl,
+                    "Page Type":       detect_page_type(vurl),
+                    "YT Email Button": yt_email_btn,
+                    "Source":          "video_description",
+                    **cadence_base,
+                })
+
             time.sleep(DELAY_BETWEEN_CHANNELS)
 
         browser.close()
 
     fields = ["Channel Name","Channel URL","Subscribers","Country",
-              "Link Label","Destination URL","Page Type","YT Email Button",
-              "Last Upload Date","Largest Upload Gap Days","No-Face Signal",
-              "Latest Video Email"]
+              "Link Label","Destination URL","Page Type","Source",
+              "YT Email Button","Last Upload Date","Largest Upload Gap Days",
+              "No-Face Signal","Latest Video Email"]
     with open(STAGE1_CSV, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader(); w.writerows(rows)
@@ -3201,10 +3325,25 @@ def crawl_creator_funnel(channel_name, seed_urls, pw_page,
             queue.append((nu, 0, "About page link"))
             queued.add(nu)
 
-    pages        = []
-    nav_explored = False  # becomes True once a nav/CTA link is successfully fetched
-    form_submits = 0      # opt-in forms filled for this creator (budget-capped)
-    instagram_seeds = [u for u in seed_urls if "instagram.com" in u.lower()]
+    pages              = []
+    nav_explored       = False  # becomes True once a nav/CTA link is successfully fetched
+    form_submits       = 0      # opt-in forms filled for this creator (budget-capped)
+    monetization_found = False  # becomes True once a real paid-offer page is parsed
+    instagram_seeds    = [u for u in seed_urls if "instagram.com" in u.lower()]
+
+    # Paths that suggest purely informational pages — skipped once we've already
+    # confirmed monetization so the crawl budget goes to offer pages, not docs.
+    _INFO_PATH_FRAGMENTS = [
+        "/about", "/about-us", "/blog", "/news", "/press", "/media",
+        "/team", "/careers", "/jobs", "/faq", "/help", "/support",
+        "/privacy", "/privacy-policy", "/terms", "/terms-of-service",
+        "/legal", "/cookie", "/sitemap", "/resources/blog",
+    ]
+
+    def _is_informational(url: str) -> bool:
+        path = urlparse(url).path.lower().rstrip("/")
+        return any(path == f or path.startswith(f + "/") or path.endswith(f)
+                   for f in _INFO_PATH_FRAGMENTS)
 
     while queue and len(pages) < max_pages:
         url, depth, source = queue.pop(0)
@@ -3268,6 +3407,12 @@ def crawl_creator_funnel(channel_name, seed_urls, pw_page,
             "Outbound Links":     len(hrefs),
         })
 
+        # Track whether we've confirmed monetization on this creator so far.
+        # Once confirmed, informational pages are skipped to preserve crawl budget.
+        if structured_products or content_type in (
+                "store", "pricing", "programs", "membership", "community", "coaching"):
+            monetization_found = True
+
         # Only expand creator_domains from known funnel platform seeds, not all hrefs
         # (prevents drift into meta.com, autods.com etc.)
         for h in hrefs:
@@ -3284,20 +3429,25 @@ def crawl_creator_funnel(channel_name, seed_urls, pw_page,
             new_regular = 0
             new_nav     = 0
 
-            # 1. Nav/CTA links get priority — insert at front of queue
+            # 1. Nav/CTA links — pre-sorted by monetization priority.
+            #    Skip informational paths once monetization is confirmed.
             for href in nav_cta_hrefs:
                 if len(queue) + len(pages) >= budget:
                     break
+                if monetization_found and _is_informational(href):
+                    continue  # skip About/Blog/FAQ now that we have what we need
                 if href not in queued and is_nav_followable(href, creator_domains, visited):
                     source_tag = f"nav/cta on {url[:45]}"
                     queue.insert(new_nav, (href, depth + 1, source_tag))
                     queued.add(href)
                     new_nav += 1
 
-            # 2. Regular anchor links
+            # 2. Regular anchor links — also skip informational once confirmed
             for href in hrefs:
                 if len(queue) + len(pages) >= budget:
                     break
+                if monetization_found and _is_informational(href):
+                    continue
                 if href not in queued and is_followable(href, creator_domains, visited):
                     queue.append((href, depth + 1, f"found on {url[:50]}"))
                     queued.add(href)
@@ -3306,8 +3456,9 @@ def crawl_creator_funnel(channel_name, seed_urls, pw_page,
             parts = []
             if new_nav:     parts.append(f"{new_nav} nav/CTA")
             if new_regular: parts.append(f"{new_regular} regular")
+            if monetization_found: parts.append("(mono confirmed — info pages skipped)")
             if parts:
-                print(f"{indent}       → queued {', '.join(parts)} link(s)")
+                print(f"{indent}       → queued {', '.join(parts)}")
 
         # ── Funnel form traversal ─────────────────────────────────────────────
         # If this page has a real form (opt-in OR a qualification questionnaire),
@@ -3715,16 +3866,19 @@ def run_stage3(stage2_rows=None):
                         "No-Face Signal":         r.get("No-Face Signal",""),
                         "Latest Video Email":     r.get("Latest Video Email",""),
                     }
-                dest = r.get("Destination URL","")
+                dest   = r.get("Destination URL","")
+                source = r.get("Source","about_page")
                 if dest:
                     seed_urls_by_name[name].append(dest)
                     seed_labels_by_name[name][dest] = r.get("Link Label","")
-                # Some About-page "links" are actually email addresses — these are
-                # on the creator's own channel, so they're trusted as-is.
+                # Emails embedded directly in bio links or video descriptions
+                # are trusted — they come from the creator's own voice.
                 for e in extract_emails(dest):
                     if name not in email_by_name:
                         email_by_name[name] = e
-                        email_source_by_name[name] = "About-page bio link"
+                        label = ("video description" if source == "video_description"
+                                 else "About-page bio link")
+                        email_source_by_name[name] = label
     except FileNotFoundError:
         pass
 
@@ -4220,7 +4374,11 @@ def _subs_int(v):
 
 def _is_approved(row):
     """Strict gate. Email is NOT required — approved leads without one are still
-    routed to APPROVED so outreach can proceed once email is sourced manually."""
+    routed to APPROVED so outreach can proceed once email is sourced manually.
+
+    Conservative ownership rule: Low ownership confidence routes to Manual Review.
+    We would rather miss a lead than confidently misattribute an offer.
+    """
     return (
         angle_bucket(row.get("Outreach Angle","")) == "QUALIFIED"
         and row.get("Data Confidence")        == "High"
@@ -4229,6 +4387,7 @@ def _is_approved(row):
         and row.get("HT Level","None")        == "None"
         and row.get("Captcha Pending","N")    == "N"
         and row.get("Highest Offer Type Found","") in ("Low Ticket", "Mid Ticket")
+        and row.get("Ownership Confidence","Low") != "Low"   # uncertain → Manual Review
     )
 
 def _attractiveness(row):
