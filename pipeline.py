@@ -1279,18 +1279,115 @@ def _detect_page_tier(page_title, page_text, url):
     return TIER_NONE, None, None
 
 
-def analyze_funnel_depth(rows, ht_level):
+_OWNERSHIP_STRONG = [
+    "work with me", "work with us", "my coaching", "my program", "my course",
+    "my mentorship", "my community", "my membership", "join my", "coach with me",
+    "apply to work with", "apply now", "book a call with me", "1:1 with me",
+    "my 1:1", "my group", "my mastermind", "my challenge", "my bootcamp",
+    "my training", "my academy", "coaching by", "trained by", "mentored by",
+    "i coach", "i mentor", "i help", "i teach", "i created", "i built",
+    "my offer", "my signature", "my flagship",
+]
+_AFFILIATE_SIGNALS = [
+    "affiliate", "referral", "ref=", "?aff=", "?discount=", "use code",
+    "promo code", "coupon", "discount code", "collab", "partner link",
+    "sponsored", "ad:", "#ad", "get % off", "code:", "ambassador",
+]
+_PARTNER_BRAND_SIGNALS = [
+    # supplement/skincare/pharma/software companies that creators link to as partners
+    "shop now", "buy now", "add to cart", "add to bag", "shop the",
+    "our products", "our supplements", "our formula", "our brand",
+    "free shipping on", "subscribe & save", "clinically proven",
+    "fda", "gmp certified", "third-party tested",
+]
+
+def classify_page_ownership(creator_name, own_domains, url, page_title,
+                             page_text, seed_label=""):
+    """
+    Determine whether a crawled page is the creator's own offer or a third-party
+    brand/affiliate. Returns (tier, confidence):
+
+      tier: "Creator Asset" | "Partner Brand" | "Affiliate Offer" | "Unknown"
+      confidence: "High" | "Medium" | "Low"
+
+    Only Creator Asset pages and Unknown pages should contribute to pricing and
+    funnel classification. Partner Brand and Affiliate pages should be noted but
+    excluded from offer attribution.
+    """
+    url_low   = (url or "").lower()
+    title_low = (page_title or "").lower()
+    text_low  = (page_text or "").lower()[:2000]   # first 2000 chars is enough
+    label_low = (seed_label or "").lower()
+    combined  = title_low + " " + text_low
+
+    # ── Affiliate link — highest priority ────────────────────────────────────
+    if any(s in label_low or s in url_low for s in _AFFILIATE_SIGNALS):
+        return "Affiliate Offer", "High"
+
+    # ── Own domain → unambiguously the creator's ─────────────────────────────
+    page_dom = _norm_domain(urlparse(url_low).netloc)
+    if own_domains and _domain_matches(page_dom, own_domains):
+        return "Creator Asset", "High"
+
+    # ── Strong ownership language in the LABEL the creator used ──────────────
+    if any(s in label_low for s in _OWNERSHIP_STRONG):
+        return "Creator Asset", "High"
+
+    # ── Creator name + ownership language ────────────────────────────────────
+    # Name alone is NOT sufficient — a creator's name appears on partner brand
+    # pages (e.g. "Founded by Kolton") without it being their coaching offer.
+    # We require BOTH the name AND ownership language to confirm Creator Asset.
+    name_parts = [w.lower() for w in (creator_name or "").split() if len(w) > 3]
+    if name_parts:
+        name_in_title = any(p in title_low for p in name_parts)
+        name_in_body  = any(p in text_low  for p in name_parts)
+        has_ownership  = any(s in combined for s in _OWNERSHIP_STRONG)
+        if (name_in_title or name_in_body) and has_ownership:
+            confidence_level = "High" if name_in_title else "Medium"
+            return "Creator Asset", confidence_level
+
+    # ── Partner brand signals (e-commerce, pharma, supplement) ───────────────
+    if any(s in combined for s in _PARTNER_BRAND_SIGNALS):
+        return "Partner Brand", "Medium"
+
+    # ── Label is an external brand name (no personal language at all) ─────────
+    # If the label is purely a brand/product name and no creator signals found:
+    if label_low and not any(s in label_low for s in
+            ["me", "my", "i ", "coach", "apply", "work", "join", "book"]):
+        # Could be the creator's own brand name — treat as Unknown, not Partner
+        return "Unknown", "Low"
+
+    return "Unknown", "Low"
+
+
+_OW_RANK = {"Creator Asset": 2, "Unknown": 1, "Partner Brand": 0, "Affiliate Offer": 0}
+_OW_CONF_RANK = {"High": 2, "Medium": 1, "Low": 0}
+
+
+def analyze_funnel_depth(rows, ht_level, creator_name="", own_domains=None, seed_labels=None):
     """
     Walk every crawled page and determine the DEEPEST monetization layer reached.
     A lead magnet is treated as a funnel entrance, never an endpoint.
 
+    Pages are classified by ownership before contributing to offer detection:
+      Creator Asset  → full contribution (pricing, tier, HT classification)
+      Unknown        → contributes to HT structural signals but not to pricing
+      Partner Brand  → excluded from offer attribution; noted separately
+      Affiliate Offer→ excluded from offer attribution; noted separately
+
     Returns dict with:
       deepest_layer, funnel_path, highest_offer_type, highest_offer_confidence,
-      lead_magnet_present, highest_tier, qualified (bool), form_crossed (bool)
+      lead_magnet_present, highest_tier, qualified (bool), form_crossed (bool),
+      ownership_confidence (High|Medium|Low), partner_pages (list of urls)
     """
     detections = []   # (depth, tier, label, price, source)
     lead_magnet_present = False
     form_crossed        = False
+    partner_pages       = []   # non-creator pages noted but excluded from scoring
+
+    # Track ownership across all pages to compute overall ownership confidence
+    ow_tiers  = []   # "Creator Asset", "Unknown", etc. for scored pages
+    ow_confs  = []
 
     for r in rows:
         ptype = r.get("Page Type", "")
@@ -1306,7 +1403,28 @@ def analyze_funnel_depth(rows, ht_level):
         if not title:
             continue
 
+        # ── Ownership classification ──────────────────────────────────────────
+        # Determine the link label the creator used for this URL (depth-0 only)
+        seed_label = (seed_labels or {}).get(url, "") if depth == 0 else ""
+        ow_tier, ow_conf = classify_page_ownership(
+            creator_name, own_domains or set(), url, title, text, seed_label
+        )
+        ow_tiers.append(ow_tier)
+        ow_confs.append(ow_conf)
+
+        # Partner Brand and confirmed Affiliate → exclude from offer scoring
+        if ow_tier in ("Partner Brand", "Affiliate Offer") and ow_conf in ("High", "Medium"):
+            partner_pages.append(url)
+            continue
+
         tier, label, price = _detect_page_tier(title, text, url)
+
+        # Unknown-ownership pages: allow HT structural detection but strip pricing
+        # (we can see "application funnel" on a partner page but not "$97 coaching")
+        if ow_tier == "Unknown" and ow_conf == "Low":
+            if tier in (TIER_LOW_TICKET, TIER_MID_TICKET):
+                price = None  # keep tier signal, drop unverified price
+
         if tier == TIER_LEAD_MAGNET:
             lead_magnet_present = True
         if tier > TIER_NONE:
@@ -1345,6 +1463,24 @@ def analyze_funnel_depth(rows, ht_level):
     # Qualification: HT endpoint disqualifies; low/mid-ticket qualifies
     qualified = highest_tier in (TIER_LOW_TICKET, TIER_MID_TICKET)
 
+    # ── Ownership confidence ──────────────────────────────────────────────────
+    # High  = at least one Creator Asset (High confidence) page found
+    # Medium= Creator Asset found but only Medium confidence, or mix
+    # Low   = no confirmed Creator Asset pages — all Unknown/Partner/Affiliate
+    creator_asset_highs   = sum(1 for t, c in zip(ow_tiers, ow_confs)
+                                if t == "Creator Asset" and c == "High")
+    creator_asset_mediums = sum(1 for t, c in zip(ow_tiers, ow_confs)
+                                if t == "Creator Asset" and c == "Medium")
+    if creator_asset_highs >= 1:
+        ownership_confidence = "High"
+    elif creator_asset_mediums >= 1:
+        ownership_confidence = "Medium"
+    else:
+        ownership_confidence = "Low"
+
+    # If ownership is Low but we found detections → flag as uncertain
+    ownership_uncertain = (ownership_confidence == "Low" and len(detections) > 0)
+
     return {
         "deepest_layer":            deepest_label,
         "funnel_path":              funnel_path,
@@ -1353,6 +1489,9 @@ def analyze_funnel_depth(rows, ht_level):
         "highest_tier":             highest_tier,
         "qualified":                qualified,
         "form_crossed":             form_crossed,
+        "ownership_confidence":     ownership_confidence,
+        "ownership_uncertain":      ownership_uncertain,
+        "partner_pages":            partner_pages,
     }
 
 
@@ -1421,7 +1560,7 @@ def assess_endpoint(rows, nav_explored, ht_level):
     }
 
 
-def classify_creator(channel_name, rows):
+def classify_creator(channel_name, rows, own_domains=None, seed_labels=None):
     """
     rows = list of Stage 2 page dicts for one creator (one row per crawled page).
     Returns a classification dict that separates data confidence from conclusions.
@@ -1457,7 +1596,10 @@ def classify_creator(channel_name, rows):
     ht_signals_found = ht_hits   # full scored signal list for reporting
 
     # ── Funnel-depth analysis (deepest monetization layer) ───────────────────
-    fd = analyze_funnel_depth(rows, ht_level)
+    fd = analyze_funnel_depth(rows, ht_level,
+                              creator_name=channel_name,
+                              own_domains=own_domains,
+                              seed_labels=seed_labels)
     highest_tier = fd["highest_tier"]
 
     # ── Endpoint certainty: can we trust the funnel's visible end? ───────────
@@ -1580,13 +1722,22 @@ def classify_creator(channel_name, rows):
     if confidence == "Low":
         gaps.append("Data insufficient — gaps cannot be confirmed without more inspection")
 
+    # ── Ownership-uncertain override ─────────────────────────────────────────
+    # If the pipeline found offers but could not confirm they belong to the
+    # creator (all pages were Partner Brand / Affiliate / Unknown), route to
+    # Manual Review rather than confidently qualifying or disqualifying.
+    ownership_confidence = fd.get("ownership_confidence", "Low")
+    ownership_uncertain  = fd.get("ownership_uncertain", False)
+    partner_pages        = fd.get("partner_pages", [])
+
     # ── Outreach angle — driven by the DEEPEST funnel layer reached ──────────
     # Decision order:
     #   1. HT confirmed              → DISQUALIFY (we found the backend)
     #   2. HT suspected              → review
     #   3. Endpoint uncertain (gate) → FLAG, neither qualify nor disqualify
-    #   4. Low/mid endpoint, clear   → QUALIFIED
-    #   5. lead-magnet / none        → provisional / needs data
+    #   4. Ownership uncertain       → FLAG, cannot attribute offer to creator
+    #   5. Low/mid endpoint, clear   → QUALIFIED
+    #   6. lead-magnet / none        → provisional / needs data
     top_signals = "; ".join(ht_signals_found[:2])
     if highest_tier == TIER_HIGH_TICKET:
         angle = (f"DISQUALIFY — funnel ends in HT ({fd['deepest_layer']}). "
@@ -1597,6 +1748,12 @@ def classify_creator(channel_name, rows):
         angle = (f"ENDPOINT UNCERTAIN — funnel continues behind a {ep['boundary']} "
                  f"we cannot see past; HT backend NOT ruled out. Manual review required. "
                  f"Path so far: {fd['funnel_path']}")
+    elif ownership_uncertain:
+        angle = (f"OFFER FOUND BUT OWNERSHIP UNCERTAIN — offers detected on pages that "
+                 f"cannot be confirmed as creator-owned (ownership conf: {ownership_confidence}). "
+                 f"Detected path: {fd['funnel_path']}. "
+                 f"Partner/affiliate pages excluded: {'; '.join(partner_pages[:3])}. "
+                 f"Manual review required before outreach.")
     elif highest_tier in (TIER_LOW_TICKET, TIER_MID_TICKET):
         if fragmented:
             assets_str = ", ".join(mono[:5])
@@ -1689,6 +1846,8 @@ def classify_creator(channel_name, rows):
         "Funnel Maturity":            maturity,
         "Monetization Gaps":          " | ".join(gaps) if gaps else "None identified",
         "Outreach Angle":             angle,
+        "Ownership Confidence":       ownership_confidence,
+        "Partner Pages Noted":        "; ".join(partner_pages[:5]) if partner_pages else "",
         "Pages Crawled":              pages_summary + instagram_note,
     }
 
@@ -3162,7 +3321,8 @@ def run_stage3(stage2_rows=None):
     stage1_meta = {}
     email_by_name = {}        # best contact email per creator
     email_source_by_name = {} # provenance of that email (trust signal for review)
-    seed_urls_by_name = defaultdict(list)  # creator's own declared About-page links
+    seed_urls_by_name   = defaultdict(list)  # creator's own declared About-page links
+    seed_labels_by_name = defaultdict(dict)  # url → link label (e.g. "Work With Me")
     try:
         with open(STAGE1_CSV, newline="", encoding="utf-8") as f:
             for r in csv.DictReader(f):
@@ -3181,6 +3341,7 @@ def run_stage3(stage2_rows=None):
                 dest = r.get("Destination URL","")
                 if dest:
                     seed_urls_by_name[name].append(dest)
+                    seed_labels_by_name[name][dest] = r.get("Link Label","")
                 # Some About-page "links" are actually email addresses — these are
                 # on the creator's own channel, so they're trusted as-is.
                 for e in extract_emails(dest):
@@ -3274,7 +3435,11 @@ def run_stage3(stage2_rows=None):
     out_rows = []
     for name, rows in by_creator.items():
         print(f"  Classifying: {name}")
-        classification = classify_creator(name, rows)
+        own = own_domains_from_urls(seed_urls_by_name.get(name, []))
+        slabels = seed_labels_by_name.get(name, {})
+        classification = classify_creator(name, rows,
+                                          own_domains=own,
+                                          seed_labels=slabels)
         classification["Email"] = email_by_name.get(name, "")
         classification["Email Source"] = email_source_by_name.get(name, "")
         s1 = stage1_meta.get(name, {})
@@ -3298,7 +3463,7 @@ def run_stage3(stage2_rows=None):
         if ig_assisted == "Y":
             # Recompute what we WOULD have concluded without the IG-discovered pages
             non_ig_rows = [r for r in rows if "ig-assisted" not in (r.get("Source","") or "").lower()]
-            prev = classify_creator(name, non_ig_rows) if non_ig_rows else {"Outreach Angle": "NEEDS MORE DATA — no YouTube funnel"}
+            prev = classify_creator(name, non_ig_rows, own_domains=own, seed_labels=slabels) if non_ig_rows else {"Outreach Angle": "NEEDS MORE DATA — no YouTube funnel"}
             prev_class = angle_bucket(prev["Outreach Angle"])
             new_class  = angle_bucket(classification["Outreach Angle"])
             if prev_class != new_class:
@@ -3397,6 +3562,7 @@ def run_stage3(stage2_rows=None):
         "Previous Classification","New Classification","Evidence Found Via Instagram",
         "Pages Crawled","YT Email Button",
         "Last Upload Date","Largest Upload Gap Days","No-Face Signal",
+        "Ownership Confidence","Partner Pages Noted",
     ]
     with open(STAGE3_CSV, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fields)
@@ -3878,6 +4044,8 @@ def build_outreach_sheets(stage3_rows=None):
             "Last Upload Date":        row.get("Last Upload Date",""),
             "Largest Upload Gap Days": row.get("Largest Upload Gap Days",""),
             "No-Face Signal":          row.get("No-Face Signal",""),
+            "Ownership Confidence":    row.get("Ownership Confidence",""),
+            "Partner Pages Noted":     row.get("Partner Pages Noted",""),
         }
 
         if _is_approved(row):
@@ -3926,10 +4094,11 @@ def build_outreach_sheets(stage3_rows=None):
         return target
 
     ap_fields = ["Channel Name","Subscribers","Email","Email Source","Channel Link",
-                 "YT Email Button","Outreach Angle","Notes"]
+                 "YT Email Button","Outreach Angle","Ownership Confidence","Notes"]
     mr_fields = ["Channel Name","Subscribers","Email","Email Source","Channel Link",
                  "YT Email Button","Confidence","Rating","Outreach Angle","Notes",
-                 "Last Upload Date","Largest Upload Gap Days","No-Face Signal"]
+                 "Last Upload Date","Largest Upload Gap Days","No-Face Signal",
+                 "Ownership Confidence","Partner Pages Noted"]
     dq_fields = ["Channel Name","Subscribers","Email","Email Source","Channel Link",
                  "HT Score","HT Level","Disqualification Reason","Evidence",
                  "Deepest Monetization Layer","Highest Offer Type Found",
