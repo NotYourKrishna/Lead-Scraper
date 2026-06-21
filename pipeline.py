@@ -125,12 +125,15 @@ NICHE_CONFIGS = {
 # Defaults — overridden by --niche CLI flag in main(); setup_niche() rebinds paths.
 NICHE              = "dropshipping"
 NICHE_QUERY        = NICHE_CONFIGS[NICHE]["queries"][0]   # legacy single-query value
-OUTPUT_DIR         = os.path.join("outputs", NICHE)
+OUTPUT_DIR         = os.path.join("outputs", NICHE)       # cross-run state (seen_channels)
+RUN_DIR            = os.path.join("runs", NICHE, "default")  # per-run versioned folder
 
-# All per-run output paths are derived from OUTPUT_DIR and rebound by setup_niche().
-STAGE1_CSV = os.path.join(OUTPUT_DIR, "stage1_links.csv")
-STAGE2_CSV = os.path.join(OUTPUT_DIR, "stage2_pages.csv")
-STAGE3_CSV = os.path.join(OUTPUT_DIR, "stage3_profiles.csv")
+# All per-run output paths are derived from RUN_DIR and rebound by setup_niche().
+# SEEN_CHANNELS_FILE lives in OUTPUT_DIR (cross-run dedup state, not per-run).
+STAGE1_CSV         = os.path.join(RUN_DIR, "stage1.csv")
+STAGE2_CSV         = os.path.join(RUN_DIR, "stage2.csv")
+STAGE3_CSV         = os.path.join(RUN_DIR, "stage3.csv")
+CRAWL_AUDIT_CSV    = os.path.join(RUN_DIR, "crawl_audit.csv")
 SEEN_CHANNELS_FILE = os.path.join(OUTPUT_DIR, "seen_channels.json")
 
 # Live funnel metrics — every stage writes here so the end-of-run report can
@@ -150,11 +153,27 @@ RUN_METRICS = {
     "stage5_seconds": 0.0,
 }
 
-def setup_niche(niche):
-    """Switch every output path (and the default query list) to a niche slug."""
-    global NICHE, NICHE_QUERY, OUTPUT_DIR
+def find_latest_run(niche):
+    """Return path to most recent timestamped run folder for this niche, or None."""
+    base = os.path.join("runs", niche)
+    if not os.path.exists(base):
+        return None
+    candidates = sorted(
+        [d for d in os.listdir(base) if os.path.isdir(os.path.join(base, d))],
+        reverse=True,
+    )
+    return os.path.join(base, candidates[0]) if candidates else None
+
+
+def setup_niche(niche, run_dir=None):
+    """Switch every output path (and the default query list) to a niche slug.
+
+    run_dir: explicit versioned run folder (e.g. when resuming with --from-stage).
+             If None, a new timestamped folder is created under runs/{niche}/.
+    """
+    global NICHE, NICHE_QUERY, OUTPUT_DIR, RUN_DIR
     global STAGE1_CSV, STAGE2_CSV, STAGE3_CSV, STAGE4_CSV, SEEN_CHANNELS_FILE
-    global CAPTCHA_PENDING_CSV, INSTAGRAM_META_CSV
+    global CAPTCHA_PENDING_CSV, INSTAGRAM_META_CSV, CRAWL_AUDIT_CSV
     global APPROVED_WITH_EMAIL_CSV, APPROVED_WITHOUT_EMAIL_CSV
     global MANUAL_REVIEW_WITH_EMAIL_CSV, MANUAL_REVIEW_WITHOUT_EMAIL_CSV
     global DISQUALIFIED_CSV
@@ -163,21 +182,34 @@ def setup_niche(niche):
             f"Unknown niche '{niche}'. Available: {', '.join(sorted(NICHE_CONFIGS))}")
     NICHE        = niche
     NICHE_QUERY  = NICHE_CONFIGS[niche]["queries"][0]
-    OUTPUT_DIR   = os.path.join("outputs", niche)
+
+    # Cross-run state: seen_channels.json stays here across runs.
+    OUTPUT_DIR = os.path.join("outputs", niche)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    STAGE1_CSV          = os.path.join(OUTPUT_DIR, "stage1_links.csv")
-    STAGE2_CSV          = os.path.join(OUTPUT_DIR, "stage2_pages.csv")
-    STAGE3_CSV          = os.path.join(OUTPUT_DIR, "stage3_profiles.csv")
-    STAGE4_CSV          = os.path.join(OUTPUT_DIR, "stage4_scored.csv")
-    SEEN_CHANNELS_FILE  = os.path.join(OUTPUT_DIR, "seen_channels.json")
-    CAPTCHA_PENDING_CSV = os.path.join(OUTPUT_DIR, "captcha_pending.csv")
-    INSTAGRAM_META_CSV  = os.path.join(OUTPUT_DIR, "instagram_meta.csv")
-    APPROVED_WITH_EMAIL_CSV         = os.path.join(OUTPUT_DIR, "APPROVED_WITH_EMAIL.csv")
-    APPROVED_WITHOUT_EMAIL_CSV      = os.path.join(OUTPUT_DIR, "APPROVED_WITHOUT_EMAIL.csv")
-    MANUAL_REVIEW_WITH_EMAIL_CSV    = os.path.join(OUTPUT_DIR, "MANUAL_REVIEW_WITH_EMAIL.csv")
-    MANUAL_REVIEW_WITHOUT_EMAIL_CSV = os.path.join(OUTPUT_DIR, "MANUAL_REVIEW_WITHOUT_EMAIL.csv")
-    DISQUALIFIED_CSV                = os.path.join(OUTPUT_DIR, "DISQUALIFIED.csv")
+    SEEN_CHANNELS_FILE = os.path.join(OUTPUT_DIR, "seen_channels.json")
+
+    # Per-run versioned folder.
+    if run_dir:
+        RUN_DIR = run_dir
+    else:
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+        RUN_DIR = os.path.join("runs", niche, timestamp)
+    os.makedirs(RUN_DIR, exist_ok=True)
+
+    STAGE1_CSV          = os.path.join(RUN_DIR, "stage1.csv")
+    STAGE2_CSV          = os.path.join(RUN_DIR, "stage2.csv")
+    STAGE3_CSV          = os.path.join(RUN_DIR, "stage3.csv")
+    STAGE4_CSV          = os.path.join(RUN_DIR, "stage4.csv")
+    CRAWL_AUDIT_CSV     = os.path.join(RUN_DIR, "crawl_audit.csv")
+    CAPTCHA_PENDING_CSV = os.path.join(RUN_DIR, "captcha_pending.csv")
+    INSTAGRAM_META_CSV  = os.path.join(RUN_DIR, "instagram_meta.csv")
+    APPROVED_WITH_EMAIL_CSV         = os.path.join(RUN_DIR, "APPROVED_WITH_EMAIL.csv")
+    APPROVED_WITHOUT_EMAIL_CSV      = os.path.join(RUN_DIR, "APPROVED_WITHOUT_EMAIL.csv")
+    MANUAL_REVIEW_WITH_EMAIL_CSV    = os.path.join(RUN_DIR, "MANUAL_REVIEW_WITH_EMAIL.csv")
+    MANUAL_REVIEW_WITHOUT_EMAIL_CSV = os.path.join(RUN_DIR, "MANUAL_REVIEW_WITHOUT_EMAIL.csv")
+    DISQUALIFIED_CSV                = os.path.join(RUN_DIR, "DISQUALIFIED.csv")
     RUN_METRICS["niche"] = niche
+    print(f"  Run folder: {RUN_DIR}")
 
 def load_seen_channels():
     if not os.path.exists(SEEN_CHANNELS_FILE):
@@ -197,7 +229,7 @@ def save_seen_channels(ids):
 
 DELAY_BETWEEN_CHANNELS = 4
 DELAY_BETWEEN_PAGES    = 2        # seconds between page loads in the crawler
-MAX_CONCURRENT_CREATORS = 3       # number of creators processed in parallel (increase to 5 for faster runs)
+MAX_CONCURRENT_CREATORS = 1       # serial crawling — correctness over speed; concurrent Playwright in threads causes page-data mixing
 ABOUT_PAGE_SETTLE_MS   = 5000
 PAGE_SETTLE_MS         = 3000     # ms to wait for JS to render on crawled pages
 PAGE_FETCH_TIMEOUT_S   = 20
@@ -224,7 +256,7 @@ MAX_FORM_STEPS   = 7               # multi-step qualification forms (Typeform et
 # autopilot — so we NEVER block the batch. When a CAPTCHA is hit we flag that creator,
 # leave its page open in a tab, record it to CAPTCHA_PENDING_CSV, and continue with
 # everyone else. You solve the flagged pages later, then re-run just those creators.
-CAPTCHA_PENDING_CSV = os.path.join(OUTPUT_DIR, "captcha_pending.csv")
+CAPTCHA_PENDING_CSV = os.path.join(RUN_DIR, "captcha_pending.csv")
 
 # Plausible "ideal high-ticket student" answers, used to traverse qualification
 # forms to their end (where a Calendly/booking link reveals the HT offer). Real
@@ -239,7 +271,7 @@ FORM_FILLER_TEXT = "Looking to scale and ready to invest in the right mentorship
 ENABLE_INSTAGRAM            = True
 IG_CREDENTIALS_FILE         = "ig_credentials.json"   # {"username":..,"password":..}
 IG_SESSION_FILE            = "ig_session.json"        # persisted Playwright storage_state
-INSTAGRAM_META_CSV          = os.path.join(OUTPUT_DIR, "instagram_meta.csv")  # per-creator IG discovery results
+INSTAGRAM_META_CSV          = os.path.join(RUN_DIR, "instagram_meta.csv")  # per-creator IG discovery results
 MAX_IG_PROFILES_PER_CREATOR = 3                       # seed profile + up to 2 tagged biz accts
 IG_ACTION_DELAY             = 3.0                     # seconds between IG actions (be gentle)
 
@@ -1530,19 +1562,25 @@ def _detect_page_tier(page_title, page_text, url,
     """
     blob   = (page_title + " " + page_text + " " + url).lower()
 
-    # High ticket — structural signals always take precedence regardless of source.
-    # Check this first so a store page that also has a strategy-call section gets
-    # correctly flagged (rare but possible).
+    # ── Step 1: structural HT signals — always checked first ──────────────────
+    # Strategy call, application funnel, mastermind, 1:1 language etc. These are
+    # definitive regardless of any price on the page.  Price-based HT ("offer
+    # price $X,XXX") is deferred until AFTER structured products have resolved
+    # buyer-only pages — a supplement store with a $3,000 bundle is NOT an HT
+    # coaching offer (see Greg Doucette $99,700 false positive).
     level, reasons = assess_ht_level(blob)
-    if level == "High":
-        label = reasons[0].split(": '")[0].strip().title() if reasons else "High-Ticket Offer"
+    structural_reasons = [r for r in reasons if "offer price" not in r]
+    if structural_reasons:
+        label = structural_reasons[0].split(": '")[0].strip().title()
         prices = extract_prices(page_title + " " + page_text)
         return TIER_HIGH_TICKET, label, (max(prices) if prices else None)
 
-    # ── Structured product path (store / pricing / programs pages) ────────────
+    # ── Step 2: Structured product path (store / pricing / programs pages) ────
     # If we extracted individual products with explicit titles, prices, and
     # categories, use those directly instead of guessing from the raw blob.
     # Priority order: coaching-demand categories first, then buyer-only.
+    # Buyer-only pages (Supplement / Physical Product) bypass the price-based HT
+    # check entirely — their prices are product prices, not offer prices.
     if structured_products:
         cat_priority = [
             # Coaching demand (what we're pitching INTO)
@@ -1590,7 +1628,14 @@ def _detect_page_tier(page_title, page_text, url,
 
         return TIER_LOW_TICKET, "Physical Product / Merch", None
 
-    # ── Raw text fallback (homepage, blog posts, linktree pages) ─────────────
+    # ── Step 3: Raw text fallback (homepage, blog posts, linktree pages) ────────
+    # Price-based HT check runs here — only after structured products have had
+    # the chance to resolve buyer-only pages (Supplement / Physical Product).
+    if level == "High":  # price-based reason from assess_ht_level
+        label = reasons[0].split(": '")[0].strip().title() if reasons else "High-Ticket Offer"
+        prices_all = extract_prices(page_title + " " + page_text)
+        return TIER_HIGH_TICKET, label, (max(prices_all) if prices_all else None)
+
     prices = extract_prices(page_title + " " + page_text)
 
     # Community / membership / subscription endpoint
@@ -1750,8 +1795,8 @@ def analyze_funnel_depth(rows, ht_level, creator_name="", own_domains=None, seed
         ow_tiers.append(ow_tier)
         ow_confs.append(ow_conf)
 
-        content_type_field   = row.get("Content Type", "") or ""
-        structured_products  = row.get("Structured Products") or []
+        content_type_field   = r.get("Content Type", "") or ""
+        structured_products  = r.get("Structured Products") or []
         tier, label, price = _detect_page_tier(
             title, text, url,
             content_type=content_type_field,
@@ -4114,6 +4159,58 @@ def run_stage3(stage2_rows=None):
           f"{needs_data} need more data → {STAGE3_CSV}")
     print(f"  Confidence breakdown: High={high_conf}  Medium={med_conf}  Low={low_conf}")
     print(f"  HT score breakdown:   High={ht_high}  Medium={ht_med}")
+    # ── Crawl Audit Trail ─────────────────────────────────────────────────────
+    # One row per page visited in Stage 2, enriched with Stage 3 ownership data.
+    # Primary purpose: prove per-creator isolation and trace classification decisions.
+    ow_conf_by_name   = {r["Channel Name"]: r.get("Ownership Confidence","")  for r in out_rows}
+    ow_class_by_name  = {}  # derive from Partner Pages Noted heuristic — not stored directly
+    for r in out_rows:
+        # "Creator Asset" if no partner pages, else we can't tell from stage3 fields alone.
+        ow_class_by_name[r["Channel Name"]] = (
+            "Creator Asset" if not r.get("Partner Pages Noted","").strip()
+            else "Mixed / Partner"
+        )
+
+    import json as _json_audit
+    audit_fields = [
+        "Creator Name", "Seed URL", "Source", "Page Visited",
+        "Content Type", "Ownership Classification", "Ownership Confidence",
+        "Monetization Signals Found", "Offer Categories Found", "Funnel Tier Found",
+    ]
+    audit_rows = []
+    for r in stage2_rows:
+        cname   = r.get("Channel Name","")
+        seeds   = seed_urls_by_name.get(cname, [])
+        sp      = r.get("Structured Products", [])
+        if isinstance(sp, str):
+            try:    sp = _json_audit.loads(sp)
+            except: sp = []
+        cats   = ", ".join(sorted({p.get("category","") for p in sp if p.get("category")}))
+        sigs   = ", ".join(sorted({p.get("title","")[:40] for p in sp if p.get("title")}))
+        tier, label, _ = _detect_page_tier(
+            r.get("Page Title",""), r.get("Extracted Text",""), r.get("URL",""),
+            r.get("Content Type",""), sp or None,
+        )
+        tier_name = {0:"None", 1:"Lead Magnet", 2:"Low Ticket",
+                     3:"Mid Ticket", 4:"High Ticket"}.get(tier, str(tier))
+        audit_rows.append({
+            "Creator Name":            cname,
+            "Seed URL":                seeds[0] if seeds else "",
+            "Source":                  r.get("Source",""),
+            "Page Visited":            r.get("URL",""),
+            "Content Type":            r.get("Content Type",""),
+            "Ownership Classification":ow_class_by_name.get(cname,""),
+            "Ownership Confidence":    ow_conf_by_name.get(cname,""),
+            "Monetization Signals Found": sigs,
+            "Offer Categories Found":  cats,
+            "Funnel Tier Found":       f"{tier_name} ({label})" if label else tier_name,
+        })
+
+    with open(CRAWL_AUDIT_CSV, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=audit_fields)
+        w.writeheader(); w.writerows(audit_rows)
+    print(f"  Crawl audit: {len(audit_rows)} page rows → {CRAWL_AUDIT_CSV}")
+
     RUN_METRICS["stage3_seconds"] = time.time() - t0_stage
     return out_rows
 
@@ -4132,7 +4229,7 @@ def run_stage3(stage2_rows=None):
 # Only QUALIFIED leads are scored. Disqualified / suspected-HT / endpoint-uncertain
 # / needs-data rows are passed through with a status and no score.
 
-STAGE4_CSV = os.path.join(OUTPUT_DIR, "stage4_scored.csv")
+STAGE4_CSV = os.path.join(RUN_DIR, "stage4.csv")
 
 # Confidence → multiplier (applied to the raw score)
 CONF_FACTOR = {"High": 1.0, "Medium": 0.82, "Low": 0.6, "": 0.7}
@@ -4356,11 +4453,11 @@ def run_stage4(stage3_rows=None):
 # NO rejected sheet. Bias is toward MANUAL_REVIEW — we would rather hand-check 20
 # extra creators than send outreach to someone already running a mature HT backend.
 
-APPROVED_WITH_EMAIL_CSV    = os.path.join(OUTPUT_DIR, "APPROVED_WITH_EMAIL.csv")
-APPROVED_WITHOUT_EMAIL_CSV = os.path.join(OUTPUT_DIR, "APPROVED_WITHOUT_EMAIL.csv")
-MANUAL_REVIEW_WITH_EMAIL_CSV    = os.path.join(OUTPUT_DIR, "MANUAL_REVIEW_WITH_EMAIL.csv")
-MANUAL_REVIEW_WITHOUT_EMAIL_CSV = os.path.join(OUTPUT_DIR, "MANUAL_REVIEW_WITHOUT_EMAIL.csv")
-DISQUALIFIED_CSV                = os.path.join(OUTPUT_DIR, "DISQUALIFIED.csv")
+APPROVED_WITH_EMAIL_CSV    = os.path.join(RUN_DIR, "APPROVED_WITH_EMAIL.csv")
+APPROVED_WITHOUT_EMAIL_CSV = os.path.join(RUN_DIR, "APPROVED_WITHOUT_EMAIL.csv")
+MANUAL_REVIEW_WITH_EMAIL_CSV    = os.path.join(RUN_DIR, "MANUAL_REVIEW_WITH_EMAIL.csv")
+MANUAL_REVIEW_WITHOUT_EMAIL_CSV = os.path.join(RUN_DIR, "MANUAL_REVIEW_WITHOUT_EMAIL.csv")
+DISQUALIFIED_CSV                = os.path.join(RUN_DIR, "DISQUALIFIED.csv")
 
 _RATING_ORDER = ["D", "C", "B", "A", "S"]   # ascending
 
@@ -4708,6 +4805,45 @@ def build_outreach_sheets(stage3_rows=None):
             print(f"    [{r['Rating']}] {e_tag} {r['Channel Name'][:26]:<26} {_subs_int(r['Subscribers']):>9,}  "
                   f"{r.get('Confidence',''):<7} {r['Notes'][:55]}")
 
+    # ── Ownership Confidence Calibration Report ───────────────────────────────
+    # Breaks down WHY creators landed in Manual Review so we can tune thresholds.
+    all_mr = mr_with + mr_without
+    if all_mr:
+        def _mr_reason(r):
+            angle = r.get("Outreach Angle","")
+            notes = r.get("Notes","")
+            if "slow cadence" in angle:               return "slow_cadence"
+            if "no personal brand" in angle:          return "no_face"
+            if r.get("No-Face Signal",""):            return "no_face"
+            if "CAPTCHA" in notes or "reCAPTCHA" in notes: return "captcha"
+            if "SUSPECTED HT" in angle:               return "suspected_ht"
+            if "NEEDS MORE DATA" in angle:            return "low_data"
+            if r.get("Ownership Confidence","") == "Low": return "low_ownership"
+            if "partial funnel" in notes:             return "partial_funnel"
+            return "other"
+
+        counts: dict[str,int] = {}
+        for r in all_mr:
+            k = _mr_reason(r)
+            counts[k] = counts.get(k, 0) + 1
+
+        label_map = {
+            "slow_cadence":   "Slow upload cadence",
+            "no_face":        "No-face / faceless brand",
+            "captcha":        "CAPTCHA blocked funnel",
+            "suspected_ht":   "Suspected HT (unconfirmed)",
+            "low_data":       "Insufficient crawl data",
+            "low_ownership":  "Low ownership confidence",
+            "partial_funnel": "Partial funnel coverage",
+            "other":          "Other / qualified but not approved",
+        }
+        print("  MANUAL REVIEW BREAKDOWN (why creators didn't auto-approve):")
+        for k, label in label_map.items():
+            n = counts.get(k, 0)
+            if n:
+                print(f"    {label:<38} {n:>3}")
+        print()
+
     RUN_METRICS["stage5_seconds"] = time.time() - t0_stage
     return ap_with, ap_without, mr_with, mr_without, disqualified_rows
 
@@ -4775,9 +4911,23 @@ if __name__ == "__main__":
     parser.add_argument("--from-stage", type=int, default=1,
                         help="Resume from stage (1=full, 2=skip discovery, 3=skip fetching, "
                              "4=score+route only, 5=route only)")
+    parser.add_argument("--run-dir", type=str, default=None,
+                        help="Explicit versioned run folder to resume from "
+                             "(default: auto-detect most recent run for this niche)")
     args = parser.parse_args()
 
-    setup_niche(args.niche)
+    if args.from_stage > 1:
+        # Resuming — find which run folder to load from.
+        run_dir = args.run_dir or find_latest_run(args.niche)
+        if not run_dir:
+            raise SystemExit(
+                f"No previous runs found for niche '{args.niche}' under runs/. "
+                f"Run from stage 1 first, or pass --run-dir explicitly.")
+        setup_niche(args.niche, run_dir=run_dir)
+        print(f"  Resuming from run: {run_dir}")
+    else:
+        setup_niche(args.niche)
+
     t0 = time.time()
 
     if args.from_stage <= 1:
