@@ -1412,18 +1412,18 @@ def analyze_funnel_depth(rows, ht_level, creator_name="", own_domains=None, seed
         ow_tiers.append(ow_tier)
         ow_confs.append(ow_conf)
 
-        # Partner Brand and confirmed Affiliate → exclude from offer scoring
-        if ow_tier in ("Partner Brand", "Affiliate Offer") and ow_conf in ("High", "Medium"):
-            partner_pages.append(url)
-            continue
-
         tier, label, price = _detect_page_tier(title, text, url)
 
-        # Unknown-ownership pages: allow HT structural detection but strip pricing
-        # (we can see "application funnel" on a partner page but not "$97 coaching")
-        if ow_tier == "Unknown" and ow_conf == "Low":
-            if tier in (TIER_LOW_TICKET, TIER_MID_TICKET):
-                price = None  # keep tier signal, drop unverified price
+        # Non-creator-asset pages: detect CATEGORY (does monetization exist?)
+        # but strip PRICE (don't attribute a specific number to the creator).
+        # Partner Brand / Affiliate pages note the URL for audit but still count
+        # toward "buyers exist" — a creator selling supplements through a partner
+        # brand still has a monetized audience.
+        if ow_tier in ("Partner Brand", "Affiliate Offer") and ow_conf in ("High", "Medium"):
+            partner_pages.append(url)
+            price = None  # no price attribution, but tier category still counts
+        elif ow_tier == "Unknown" or ow_conf == "Low":
+            price = None  # category counts, price stripped until ownership confirmed
 
         if tier == TIER_LEAD_MAGNET:
             lead_magnet_present = True
@@ -1735,10 +1735,42 @@ def classify_creator(channel_name, rows, own_domains=None, seed_labels=None):
     #   1. HT confirmed              → DISQUALIFY (we found the backend)
     #   2. HT suspected              → review
     #   3. Endpoint uncertain (gate) → FLAG, neither qualify nor disqualify
-    #   4. Ownership uncertain       → FLAG, cannot attribute offer to creator
-    #   5. Low/mid endpoint, clear   → QUALIFIED
-    #   6. lead-magnet / none        → provisional / needs data
+    #   4. Low/mid monetization      → QUALIFIED (broad language unless ownership High)
+    #   5. lead-magnet / none        → provisional / needs data
+    #
+    # Broad-language rule: outreach angle never names specific prices or product
+    # names unless ownership_confidence == "High". Being wrong about which offer
+    # belongs to the creator damages credibility; existence of buyers is sufficient
+    # to qualify a lead. Specifics stay in the internal audit trail only.
     top_signals = "; ".join(ht_signals_found[:2])
+
+    def _category_list():
+        """Deduplicated human-readable monetization categories from detected assets."""
+        cats = []
+        for a in (mono or []):
+            a_low = a.lower()
+            if "course" in a_low or "program" in a_low:
+                cats.append("course/program")
+            elif "community" in a_low or "membership" in a_low:
+                cats.append("community/membership")
+            elif "supplement" in a_low or "product" in a_low or "shop" in a_low:
+                cats.append("products/supplements")
+            elif "service" in a_low or "coaching" in a_low:
+                cats.append("coaching/services")
+            elif "software" in a_low or "app" in a_low or "saas" in a_low:
+                cats.append("software/app")
+            elif "book" in a_low or "ebook" in a_low:
+                cats.append("book/content")
+            elif "lead" in a_low or "magnet" in a_low or "free" in a_low:
+                cats.append("lead capture")
+            else:
+                cats.append(a_low)
+        seen = []
+        for c in cats:
+            if c not in seen:
+                seen.append(c)
+        return seen
+
     if highest_tier == TIER_HIGH_TICKET:
         angle = (f"DISQUALIFY — funnel ends in HT ({fd['deepest_layer']}). "
                  f"Path: {fd['funnel_path']}")
@@ -1748,28 +1780,36 @@ def classify_creator(channel_name, rows, own_domains=None, seed_labels=None):
         angle = (f"ENDPOINT UNCERTAIN — funnel continues behind a {ep['boundary']} "
                  f"we cannot see past; HT backend NOT ruled out. Manual review required. "
                  f"Path so far: {fd['funnel_path']}")
-    elif ownership_uncertain:
-        angle = (f"OFFER FOUND BUT OWNERSHIP UNCERTAIN — offers detected on pages that "
-                 f"cannot be confirmed as creator-owned (ownership conf: {ownership_confidence}). "
-                 f"Detected path: {fd['funnel_path']}. "
-                 f"Partner/affiliate pages excluded: {'; '.join(partner_pages[:3])}. "
-                 f"Manual review required before outreach.")
     elif highest_tier in (TIER_LOW_TICKET, TIER_MID_TICKET):
+        cats = _category_list()
+        cats_str = ", ".join(cats) if cats else "multiple offer types"
         if fragmented:
-            assets_str = ", ".join(mono[:5])
-            price_str  = ("/".join(f"${p}" for p in distinct_prices[:4])
-                          if distinct_prices else "")
-            angle = (f"QUALIFIED (consolidation play) — fragmented offers "
-                     f"[{assets_str}{('; prices ' + price_str) if price_str else ''}] "
-                     f"scattered with no single home; pitch consolidating them under one "
-                     f"roof — a high-ticket service you'd build & run for them. Deepest "
-                     f"layer {fd['deepest_layer']}, no HT backend (endpoint conf "
-                     f"{ep['endpoint_confidence']}). Path: {fd['funnel_path']}")
+            if ownership_confidence == "High":
+                assets_str = ", ".join(mono[:5])
+                price_str  = ("/".join(f"${p}" for p in distinct_prices[:4])
+                              if distinct_prices else "")
+                angle = (f"QUALIFIED (consolidation play) — fragmented offers "
+                         f"[{assets_str}{('; prices ' + price_str) if price_str else ''}] "
+                         f"scattered with no single home; pitch consolidating them under one "
+                         f"roof — a high-ticket service you'd build & run for them. Deepest "
+                         f"layer {fd['deepest_layer']}, no HT backend (endpoint conf "
+                         f"{ep['endpoint_confidence']}). Path: {fd['funnel_path']}")
+            else:
+                angle = (f"QUALIFIED (consolidation play) — multiple monetized offer "
+                         f"categories detected ({cats_str}); audience clearly buys across "
+                         f"several channels. No single HT home — pitch consolidating under "
+                         f"one premium service. No HT backend found (endpoint conf "
+                         f"{ep['endpoint_confidence']}).")
         else:
-            angle = (f"QUALIFIED — funnel ends at {fd['highest_offer_type']} "
-                     f"({fd['deepest_layer']}), no HT backend found (endpoint conf "
-                     f"{ep['endpoint_confidence']}). Path: {fd['funnel_path']} "
-                     f"— pitch HT ascension offer")
+            if ownership_confidence == "High":
+                angle = (f"QUALIFIED — funnel ends at {fd['highest_offer_type']} "
+                         f"({fd['deepest_layer']}), no HT backend found (endpoint conf "
+                         f"{ep['endpoint_confidence']}). Path: {fd['funnel_path']} "
+                         f"— pitch HT ascension offer")
+            else:
+                angle = (f"QUALIFIED — monetized audience confirmed "
+                         f"({cats_str} detected); no HT backend found. "
+                         f"Pitch HT ascension offer.")
     elif highest_tier == TIER_LEAD_MAGNET:
         if confidence == "Low":
             angle = "NEEDS MORE DATA — lead magnet found but funnel not fully reachable: " + suf["notes"]
@@ -3899,29 +3939,41 @@ def _rating(row):
         letter = _rating_cap(letter, "B")
     return letter
 
-def _verified_price_str(row):
-    """Return a 'Current Offers: ...' line using prices confirmed by extract_prices().
+def _monetization_summary(row):
+    """Human-readable monetization summary for outreach notes.
 
-    Pulls from the funnel path (which records tier + price per step) and the
-    deepest layer field. Falls back to 'Pricing not confidently determined' if
-    no concrete price was attached to an offer by the extractor.
+    Broad language unless Ownership Confidence is High — see outreach angle rule.
+    When High: names the offer type and price if available.
+    When Medium/Low: states 'monetized audience confirmed' with category list only.
     """
-    path  = row.get("Funnel Path","") or ""
-    layer = row.get("Deepest Monetization Layer","") or ""
-    # extract $NNN patterns that actually appear next to offer labels in path/layer
-    price_hits = re.findall(r"\$(\d[\d,]*)", path + " " + layer)
-    prices = []
-    for p in price_hits:
-        try:
-            v = int(p.replace(",",""))
-            if 1 <= v < 100_000 and v not in prices:
-                prices.append(v)
-        except ValueError:
-            pass
-    if not prices:
-        return "Pricing not confidently determined"
-    ot = row.get("Highest Offer Type Found","offer")
-    return "Current offer: " + " / ".join(f"${p:,}" for p in sorted(prices))
+    ow_conf = row.get("Ownership Confidence", "Low") or "Low"
+    ot      = row.get("Highest Offer Type Found", "") or ""
+    angle   = row.get("Outreach Angle", "") or ""
+
+    # Extract category hints from angle text (already broad-language formatted)
+    cat_match = re.search(r"\(([^)]+detected[^)]*)\)", angle)
+    cats_str  = cat_match.group(1) if cat_match else ""
+
+    if ow_conf == "High":
+        # Safe to be specific — pull confirmed prices from funnel path / layer
+        path  = row.get("Funnel Path","") or ""
+        layer = row.get("Deepest Monetization Layer","") or ""
+        price_hits = re.findall(r"\$(\d[\d,]*)", path + " " + layer)
+        prices = []
+        for p in price_hits:
+            try:
+                v = int(p.replace(",",""))
+                if 1 <= v < 100_000 and v not in prices:
+                    prices.append(v)
+            except ValueError:
+                pass
+        price_part = (" — " + " / ".join(f"${p:,}" for p in sorted(prices))) if prices else ""
+        return f"Confirmed {ot.lower() or 'offer'} detected{price_part}"
+    else:
+        # Broad: existence of buyers confirmed, no specific attribution
+        if cats_str:
+            return f"Monetized audience confirmed ({cats_str})"
+        return "Multiple monetized offers detected"
 
 
 def _approved_note(row):
@@ -3930,14 +3982,14 @@ def _approved_note(row):
     has_lm   = row.get("Lead Magnet Present (Y/N)")=="Y"
     ot       = row.get("Highest Offer Type Found","")
     big_aud  = _subs_int(row.get("Subscribers")) >= 500_000
-    price_str = _verified_price_str(row)
+    mono_str = _monetization_summary(row)
     if has_comm:
-        return f"Community + course, no coaching detected — proven buyers, no ascension model. {price_str}"
+        return f"Community offer detected, no HT coaching backend found — proven buyers, no ascension model. {mono_str}"
     if has_lm:
-        return f"Lead magnet funnels into {ot.lower()} offer, no HT backend found. {price_str}"
+        return f"Lead magnet present, no HT backend found. {mono_str}"
     if big_aud:
-        return f"Large audience, low-ticket monetization only, no HT backend found. {price_str}"
-    return f"{ot} only, no HT backend found — proven buyers, no ascension model. {price_str}"
+        return f"Large audience, low-ticket monetization only, no HT backend found. {mono_str}"
+    return f"{ot or 'Offer'} detected, no HT backend found — proven buyers, no ascension model. {mono_str}"
 
 def _review_note(row):
     reasons = []
@@ -3969,12 +4021,10 @@ def _review_note(row):
         reasons.append("Instagram-assisted discovery incomplete")
     if not reasons:
         reasons.append("not confidently approved — verify funnel")
-    # Lead with the positive when the creator is otherwise attractive
     ot = row.get("Highest Offer Type Found","")
     if ot in ("Low Ticket","Mid Ticket") and bkt not in ("DISQUALIFIED",):
         reasons.insert(0, f"{ot} offer, no confirmed HT")
-    price_str = _verified_price_str(row)
-    reasons.append(price_str)
+    reasons.append(_monetization_summary(row))
     return "; ".join(reasons)
 
 
