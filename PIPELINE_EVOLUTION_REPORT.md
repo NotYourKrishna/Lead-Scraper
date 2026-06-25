@@ -333,10 +333,20 @@ qualification-form traversal, and non-blocking CAPTCHA deferral.
 
 ### 3.15 No-face detector failures
 - **Symptoms:** Verified personal brands flagged "no personal brand detected" and held in Manual Review.
-- **Root cause:** The detection pattern matches the literal word **"and"** (`" and "`) in a channel description — i.e. nearly every description. Standalone tokens `channel`, `education`, `media` also over-fire.
+- **Root cause (two layers):**
+  1. *Matching bug* — the detection pattern matches the literal word **"and"** (`" and "`) in a channel description, i.e. nearly every description. Standalone tokens `channel`, `education`, `media` also over-fire.
+  2. *Design flaw* — even with perfect matching, treating "no face" as a hard **Manual-Review gate** is wrong. A confirmed faceless brand should *lower lead quality*, not block qualification.
 - **Examples (latest run):** Hybrid Calisthenics (Hampton Liu), SheMoves (Marina Zinchuk), Calisthenics with Lavender — all real humans, all stuck.
 - **Impact:** **12 of 14 Manual Review creators** in the latest run were blocked solely by this. Single biggest yield bottleneck.
-- **Fix:** ❌ Not yet implemented.
+- **Decision (2026-06-21):** keep the no-face *concept* but redesign it as a **scoring signal**, not a gate:
+  - Clearly personal brand → **positive** signal (raises score).
+  - Clearly faceless brand → **negative** signal / lower score (NOT auto-block).
+  - Uncertain → Manual Review.
+  *Rationale:* for this HT service, faceless creators are weaker HT prospects — HT
+  coaching/mentorship/masterminds rely on personal trust and authority, whereas
+  faceless creators can still sell LT PDFs/courses/memberships. So face presence
+  should weight **ICP score (Stage 4)**, not the Stage 3 REVIEW_REQUIRED override.
+- **Fix:** ❌ Not yet implemented (design agreed; see Section 12).
 - **Status:** 🔴 Open — **highest priority** (Section 10).
 
 ### 3.16 Missing video-description signals
@@ -588,7 +598,7 @@ affiliate seed (GORNATION) consumes the whole crawl budget; (3) no-face blocks
 
 | # | Issue | Sev | Est. impact | Suggested fix |
 |---|-------|-----|-------------|---------------|
-| 1 | No-face detector matches " and " | 🔴 Critical | ~6 extra approvals/batch; 12/14 MR blocked | Require proper-noun adjacency; drop standalone channel/education/media |
+| 1 | No-face: broken matcher + used as a hard gate | 🔴 Critical | ~6 extra approvals/batch; 12/14 MR blocked | (a) Fix matcher (proper-noun adjacency; drop standalone channel/education/media). (b) Redesign as ICP score weight: personal=+, faceless=−, uncertain=MR. Not a qualification gate. |
 | 2 | Qualified-but-uncontactable → DISQUALIFIED | 🔴 High | Best leads buried (Will Tennyson 89/100) | Route ICP>0 + no-contact to MR-Without-Email |
 | 3 | Affiliate-seed budget burn (GORNATION) | 🔴 High | Wrong tier/angle/prices on affected creators | Deprioritize `?ref=/?aff=` seeds; crawl own-domain first |
 | 4 | Linktree/Typeform/Calendly platform contamination | 🔴 High | False HT DQs (Fun With Calisthenics) | At depth≥1 on known platforms, only follow links exiting to creator domain |
@@ -636,7 +646,11 @@ debugging from guesswork into evidence).
 ## SECTION 12 — ROADMAP
 
 ### Immediate (highest priority — do before the next validation run)
-1. **Fix the no-face signal** (Issue 1). Single highest-leverage change; unblocks ~6 approvals/batch.
+1. **Redesign the no-face signal** (Issue 1). Single highest-leverage change; unblocks ~6 approvals/batch.
+   Two parts: (a) fix the matcher so it stops firing on ordinary words; (b) move the
+   signal from the Stage 3 REVIEW_REQUIRED override into **Stage 4 ICP scoring** as a
+   weight — personal brand raises score, confirmed faceless lowers it, only *uncertain*
+   face-presence routes to Manual Review. Faceless no longer blocks qualification.
 2. **Reclassify qualified-but-uncontactable** to Manual Review Without Email (Issue 2). Stops burying the best leads.
 3. **Affiliate-seed demotion** (Issue 3) and **platform-page navigation stop** (Issue 4). These two fix the worst data-quality errors (GORNATION, Linktree/Typeform).
 

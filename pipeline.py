@@ -48,7 +48,8 @@ sys.stdout.reconfigure(encoding="utf-8")
 # ══════════════════════════════════════════════════════════════════════════════
 
 API_KEY           = os.environ.get("YOUTUBE_API_KEY", "")
-MIN_SUBS          = 500
+MIN_SUBS          = 500     # rebound per-niche by setup_niche() from config "min_subs"
+MAX_SUBS          = None    # rebound per-niche from config "max_subs" (None = no ceiling)
 MAX_DAYS_INACTIVE = 90
 MAX_RESULTS       = 50              # per-query cap from the YouTube search API
 
@@ -77,13 +78,32 @@ NICHE_CONFIGS = {
         "target_leads": 50,
     },
     "fitness": {
+        # Batch 3 (2026-06-23): retired the original 10 generic queries — they were
+        # exhausted (batch 1+2 took their top-50 results). These 38 target fresh
+        # sub-niches/modalities/audiences to surface NEW creators after dedup.
         "queries": [
-            "fitness coach", "online personal trainer", "fat loss coach",
-            "muscle building coach", "fitness business", "online fitness coaching",
-            "calisthenics coach", "bodybuilding coach", "nutrition coach",
-            "women's fitness coach",
+            # Transformation / personal brand
+            "weight loss journey", "body transformation", "fitness transformation",
+            "natural bodybuilding", "fitness challenge", "muscle gain tips",
+            "fat loss transformation",
+            # Education / science
+            "exercise science", "hypertrophy", "strength training", "muscle growth",
+            "fitness science", "workout mistakes", "training advice", "fitness myths",
+            # Audience-specific
+            "fitness over 40", "fitness over 50", "busy moms fitness", "dad fitness",
+            "menopause fitness", "women's fat loss", "senior fitness",
+            # Modality-specific
+            "powerlifting coach", "strongman training", "running coach",
+            "marathon training", "triathlon coach", "mobility coach",
+            "kettlebell training", "functional fitness",
+            # Fitness-adjacent
+            "sports nutrition", "macro tracking", "healthy recipes",
+            "meal prep fitness", "body recomposition", "fitness entrepreneur",
+            "gym business", "fitness marketing",
         ],
-        "target_leads": 50,
+        "target_leads": 80,
+        "min_subs": 10000,
+        "max_subs": 500000,
     },
     "personal_finance": {
         "queries": [
@@ -182,6 +202,11 @@ def setup_niche(niche, run_dir=None):
             f"Unknown niche '{niche}'. Available: {', '.join(sorted(NICHE_CONFIGS))}")
     NICHE        = niche
     NICHE_QUERY  = NICHE_CONFIGS[niche]["queries"][0]
+
+    # Per-niche discovery subscriber band (defaults: floor 500, no ceiling).
+    global MIN_SUBS, MAX_SUBS
+    MIN_SUBS = NICHE_CONFIGS[niche].get("min_subs", 500)
+    MAX_SUBS = NICHE_CONFIGS[niche].get("max_subs", None)
 
     # Cross-run state: seen_channels.json stays here across runs.
     OUTPUT_DIR = os.path.join("outputs", niche)
@@ -2371,7 +2396,7 @@ def run_stage1():
                 counts["geo"] += 1
                 print(f"  skip [geo: {geo_why}]  {d['title']}")
                 continue
-            if d["subs"] < MIN_SUBS:
+            if d["subs"] < MIN_SUBS or (MAX_SUBS is not None and d["subs"] > MAX_SUBS):
                 counts["subs"] += 1
                 continue
             latest, max_gap_days, top_video_ids = get_upload_cadence(d["uploads"])
@@ -2421,99 +2446,127 @@ def run_stage1():
     RUN_METRICS["unique_processed"]        = len(surviving)
 
     rows = []
+    fields = ["Channel Name","Channel URL","Subscribers","Country",
+              "Link Label","Destination URL","Page Type","Source",
+              "YT Email Button","Last Upload Date","Largest Upload Gap Days",
+              "No-Face Signal","Latest Video Email"]
+    # Robustness (2026-06-24): stage1.csv is opened up front and FLUSHED after every
+    # creator, so a mid-loop death (renderer crash, machine sleep, external kill) keeps
+    # all work done so far — previously the file was written only after the full loop, so
+    # any death lost everything. Each creator is wrapped in try/except (one bad About page
+    # can't kill the run) and the browser context is recycled every 20 creators to bound
+    # renderer-memory growth across many heavy-site navigations (the likely crash cause).
+    f_out  = open(STAGE1_CSV, "w", newline="", encoding="utf-8")
+    writer = csv.DictWriter(f_out, fieldnames=fields)
+    writer.writeheader(); f_out.flush()
+
+    def _new_ctx(browser):
+        c = browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            locale="en-US", viewport={"width":1280,"height":900},
+        )
+        pg = c.new_page()
+        pg.goto("https://www.youtube.com", wait_until="domcontentloaded", timeout=20000)
+        dismiss_consent(pg)
+        pg.wait_for_timeout(2000)
+        return c, pg
+
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=False, slow_mo=150, executable_path=CHROME_PATH,
             args=["--disable-blink-features=AutomationControlled","--no-sandbox"],
         )
-        ctx  = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            locale="en-US", viewport={"width":1280,"height":900},
-        )
-        page = ctx.new_page()
         print("Browser warm-up ...")
-        page.goto("https://www.youtube.com", wait_until="domcontentloaded", timeout=20000)
-        dismiss_consent(page)
-        page.wait_for_timeout(2000)
+        ctx, page = _new_ctx(browser)
 
-        for ch in surviving:
+        for i, ch in enumerate(surviving):
+            if i > 0 and i % 20 == 0:
+                print(f"  ↻ recycling browser context after {i} creators")
+                try: ctx.close()
+                except Exception: pass
+                ctx, page = _new_ctx(browser)
+
             print(f"\n  → {ch['title']}")
-            links        = extract_about_links(page, ch["about_url"], ch["title"])
-            yt_email_btn = "Y" if check_yt_email_button(page, ch["url"]) else "N"
+            creator_rows = []
+            try:
+                links        = extract_about_links(page, ch["about_url"], ch["title"])
+                yt_email_btn = "Y" if check_yt_email_button(page, ch["url"]) else "N"
 
-            # Fetch signals from latest 3 video descriptions — first-class data source.
-            # Creators embed booking links, Skool, Calendly, coaching pages, emails here
-            # with the same intent as their bio links.
-            vid_signals   = get_video_description_signals(ch.get("top_video_ids", []))
-            vid_email     = vid_signals["emails"][0] if vid_signals["emails"] else ""
-            vid_seed_urls = vid_signals["seed_urls"]  # fed into Stage 2 as crawl seeds
-            if vid_seed_urls:
-                print(f"     video desc: {len(vid_seed_urls)} monetization link(s) found")
-            if vid_email:
-                print(f"     video desc email: {vid_email}")
+                # Latest 3 video descriptions — first-class data source (booking links,
+                # Skool, Calendly, coaching pages, emails embedded like bio links).
+                vid_signals   = get_video_description_signals(ch.get("top_video_ids", []))
+                vid_email     = vid_signals["emails"][0] if vid_signals["emails"] else ""
+                vid_seed_urls = vid_signals["seed_urls"]
+                if vid_seed_urls:
+                    print(f"     video desc: {len(vid_seed_urls)} monetization link(s) found")
+                if vid_email:
+                    print(f"     video desc email: {vid_email}")
 
-            cadence_base = {
-                "Last Upload Date":        ch.get("last_upload", ""),
-                "Largest Upload Gap Days": ch.get("max_gap_days", ""),
-                "No-Face Signal":          ch.get("no_face_signal", ""),
-                "Latest Video Email":      vid_email,
-            }
+                cadence_base = {
+                    "Last Upload Date":        ch.get("last_upload", ""),
+                    "Largest Upload Gap Days": ch.get("max_gap_days", ""),
+                    "No-Face Signal":          ch.get("no_face_signal", ""),
+                    "Latest Video Email":      vid_email,
+                }
 
-            # About-page links (primary seeds)
-            if links:
-                for lk in links:
-                    rows.append({
+                if links:
+                    for lk in links:
+                        creator_rows.append({
+                            "Channel Name":    ch["title"],
+                            "Channel URL":     ch["url"],
+                            "Subscribers":     ch["subs"],
+                            "Country":         ch["country"] or "unknown",
+                            "Link Label":      lk["label"],
+                            "Destination URL": lk["url"],
+                            "Page Type":       detect_page_type(lk["url"]),
+                            "YT Email Button": yt_email_btn,
+                            "Source":          "about_page",
+                            **cadence_base,
+                        })
+                else:
+                    creator_rows.append({
                         "Channel Name":    ch["title"],
                         "Channel URL":     ch["url"],
                         "Subscribers":     ch["subs"],
                         "Country":         ch["country"] or "unknown",
-                        "Link Label":      lk["label"],
-                        "Destination URL": lk["url"],
-                        "Page Type":       detect_page_type(lk["url"]),
+                        "Link Label":      "(none found)",
+                        "Destination URL": "",
+                        "Page Type":       "",
                         "YT Email Button": yt_email_btn,
                         "Source":          "about_page",
                         **cadence_base,
                     })
-            else:
-                rows.append({
-                    "Channel Name":    ch["title"],
-                    "Channel URL":     ch["url"],
-                    "Subscribers":     ch["subs"],
-                    "Country":         ch["country"] or "unknown",
-                    "Link Label":      "(none found)",
-                    "Destination URL": "",
-                    "Page Type":       "",
-                    "YT Email Button": yt_email_btn,
-                    "Source":          "about_page",
-                    **cadence_base,
-                })
 
-            # Video-description seeds (treated equally to About links for crawling)
-            for vurl in vid_seed_urls:
-                rows.append({
-                    "Channel Name":    ch["title"],
-                    "Channel URL":     ch["url"],
-                    "Subscribers":     ch["subs"],
-                    "Country":         ch["country"] or "unknown",
-                    "Link Label":      "video description link",
-                    "Destination URL": vurl,
-                    "Page Type":       detect_page_type(vurl),
-                    "YT Email Button": yt_email_btn,
-                    "Source":          "video_description",
-                    **cadence_base,
-                })
+                for vurl in vid_seed_urls:
+                    creator_rows.append({
+                        "Channel Name":    ch["title"],
+                        "Channel URL":     ch["url"],
+                        "Subscribers":     ch["subs"],
+                        "Country":         ch["country"] or "unknown",
+                        "Link Label":      "video description link",
+                        "Destination URL": vurl,
+                        "Page Type":       detect_page_type(vurl),
+                        "YT Email Button": yt_email_btn,
+                        "Source":          "video_description",
+                        **cadence_base,
+                    })
+            except Exception as e:
+                print(f"     ⚠ skipped {ch['title']}: {type(e).__name__}: {e}")
+                # Recover the page/context so the next creator isn't poisoned.
+                try: ctx.close()
+                except Exception: pass
+                try: ctx, page = _new_ctx(browser)
+                except Exception: pass
+
+            # Write this creator's rows immediately + flush (incremental, crash-safe).
+            if creator_rows:
+                writer.writerows(creator_rows); f_out.flush()
+                rows.extend(creator_rows)
 
             time.sleep(DELAY_BETWEEN_CHANNELS)
 
         browser.close()
-
-    fields = ["Channel Name","Channel URL","Subscribers","Country",
-              "Link Label","Destination URL","Page Type","Source",
-              "YT Email Button","Last Upload Date","Largest Upload Gap Days",
-              "No-Face Signal","Latest Video Email"]
-    with open(STAGE1_CSV, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fields)
-        w.writeheader(); w.writerows(rows)
+    f_out.close()
 
     link_count = sum(1 for r in rows if r["Destination URL"])
     print(f"\n✓ Stage 1 — {len(surviving)} channels, {link_count} links → {STAGE1_CSV}")
@@ -3664,6 +3717,22 @@ def run_stage2(stage1_rows=None, extra_seeds=None):
                     by_creator[name]["seed_labels"][u] = "manual seed"
 
     all_page_rows = []
+    # Resume: if a partial stage2.csv exists for this run, load it and skip creators
+    # already crawled, so a re-run continues from where it stopped instead of restarting.
+    # Combined with the per-creator checkpoint, the crawl survives any interruption in
+    # short hops rather than needing one unbroken multi-hour window.
+    done_creators = set()
+    if os.path.exists(STAGE2_CSV):
+        try:
+            with open(STAGE2_CSV, newline="", encoding="utf-8") as _rf:
+                for _r in csv.DictReader(_rf):
+                    all_page_rows.append(_r)
+                    done_creators.add(_r.get("Channel Name",""))
+            if done_creators:
+                print(f"  ↩ resume: {len(done_creators)} creator(s) already crawled — skipping them")
+        except Exception as _e:
+            print(f"  ⚠ could not load prior stage2.csv for resume ({_e}); starting fresh")
+            all_page_rows, done_creators = [], set()
     print_lock = threading.Lock()
     creator_start_times = {}  # name → start time, for avg processing time metric
 
@@ -3688,23 +3757,40 @@ def run_stage2(stage1_rows=None, extra_seeds=None):
                 "Outbound Links": 0,
             })
         else:
+            browser = None
             try:
                 with sync_playwright() as pw:
+                    # headless + process caps: the visible browser was spawning dozens of
+                    # Chrome processes per store creator (Fourthwall/Shopify), exhausting
+                    # system RAM and getting the run OOM-killed at ~creator 13. Headless
+                    # drops the GPU/UI layer; the flags cap renderer process spawn.
                     browser = pw.chromium.launch(
-                        headless=False, slow_mo=100, executable_path=CHROME_PATH,
-                        args=["--disable-blink-features=AutomationControlled","--no-sandbox"],
+                        headless=True, slow_mo=0, executable_path=CHROME_PATH,
+                        args=["--disable-blink-features=AutomationControlled","--no-sandbox",
+                              "--disable-gpu","--disable-dev-shm-usage",
+                              "--renderer-process-limit=4","--js-flags=--max-old-space-size=512"],
                     )
                     ctx = browser.new_context(
                         user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
                         locale="en-US", viewport={"width":1280,"height":900},
                     )
                     pw_page = ctx.new_page()
-                    pages = crawl_creator_funnel(name, seeds, pw_page)
-                    browser.close()
+                    try:
+                        pages = crawl_creator_funnel(name, seeds, pw_page)
+                    finally:
+                        # ALWAYS close the browser — even on error/hang — so Chrome
+                        # processes can't accumulate across creators and OOM the run.
+                        try: ctx.close()
+                        except Exception: pass
+                        try: browser.close()
+                        except Exception: pass
             except Exception as exc:
                 with print_lock:
                     print(f"  [ERROR] {name}: {exc}")
                     traceback.print_exc()
+                try:
+                    if browser is not None: browser.close()
+                except Exception: pass
         elapsed = time.time() - t_start
         mem_mb  = psutil.Process().memory_info().rss / 1024 / 1024
         with print_lock:
@@ -3713,8 +3799,30 @@ def run_stage2(stage1_rows=None, extra_seeds=None):
         return name, pages
 
     # ── Parallel funnel crawl (no IG — IG is serial below) ───────────────────
-    creator_list = list(by_creator.items())
+    creator_list = [(n, info) for n, info in by_creator.items() if n not in done_creators]
+    if done_creators:
+        print(f"  → {len(creator_list)} creator(s) remaining to crawl")
     pages_by_creator = {}  # name → page rows (preserved order for IG phase)
+
+    # Crash-safety: checkpoint stage2.csv after every creator so a mid-crawl death
+    # (machine sleep over a multi-hour run, OOM) keeps all pages crawled so far. The
+    # bulk write at the end of the stage is otherwise the ONLY write — same fragility
+    # that lost two Stage-1 discovery runs. Cheap (n creators is small).
+    _stage2_fields = ["Channel Name","Depth","Source","Page Type","Content Type",
+                      "URL","Page Title","Extracted Text","Outbound Links",
+                      "Structured Products"]
+    def _checkpoint_stage2():
+        import json as _json
+        out = []
+        for r in all_page_rows:
+            rr = dict(r)
+            sp = rr.get("Structured Products")
+            if isinstance(sp, list):
+                rr["Structured Products"] = _json.dumps(sp) if sp else ""
+            out.append(rr)
+        with open(STAGE2_CSV, "w", newline="", encoding="utf-8") as cf:
+            cw = csv.DictWriter(cf, fieldnames=_stage2_fields, extrasaction="ignore")
+            cw.writeheader(); cw.writerows(out)
 
     t_parallel_start = time.time()
     with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_CREATORS) as pool:
@@ -3725,6 +3833,7 @@ def run_stage2(stage1_rows=None, extra_seeds=None):
                 name, pages = fut.result()
                 pages_by_creator[name] = pages
                 all_page_rows.extend(pages)
+                _checkpoint_stage2()   # crash-safe incremental persist
             except Exception as exc:
                 name = futures[fut]
                 with print_lock:
@@ -4929,6 +5038,9 @@ if __name__ == "__main__":
     parser.add_argument("--from-stage", type=int, default=1,
                         help="Resume from stage (1=full, 2=skip discovery, 3=skip fetching, "
                              "4=score+route only, 5=route only)")
+    parser.add_argument("--to-stage", type=int, default=5,
+                        help="Stop after this stage (e.g. 1 = discovery only; writes "
+                             "stage1.csv then exits so you can inspect before crawling)")
     parser.add_argument("--run-dir", type=str, default=None,
                         help="Explicit versioned run folder to resume from "
                              "(default: auto-detect most recent run for this niche)")
@@ -4946,6 +5058,20 @@ if __name__ == "__main__":
     else:
         setup_niche(args.niche)
 
+    # Keep the machine awake for the whole run. Long crawls were dying as clean freezes
+    # (no traceback) ~15 min in whenever the operator stepped away — Windows idle-sleep
+    # was suspending the process. ES_CONTINUOUS | ES_SYSTEM_REQUIRED tells Windows not to
+    # sleep while we run (display may still turn off). Reset on exit.
+    if sys.platform == "win32":
+        try:
+            import ctypes, atexit
+            ES_CONTINUOUS, ES_SYSTEM_REQUIRED = 0x80000000, 0x00000001
+            ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)
+            atexit.register(lambda: ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS))
+            print("  ⏻ sleep inhibitor active — machine will stay awake during the run")
+        except Exception as _e:
+            print(f"  ⚠ could not set sleep inhibitor: {_e}")
+
     t0 = time.time()
 
     if args.from_stage <= 1:
@@ -4954,6 +5080,11 @@ if __name__ == "__main__":
         print(f"Skipping Stage 1 — loading {STAGE1_CSV}")
         with open(STAGE1_CSV, newline="", encoding="utf-8") as f:
             stage1_rows = list(csv.DictReader(f))
+
+    if args.to_stage <= 1:
+        print(f"\nStopping after Stage 1 (--to-stage 1). Discovery written to:\n  {STAGE1_CSV}")
+        print(f"  Resume the crawl with: --from-stage 2 --run-dir {RUN_DIR}")
+        raise SystemExit(0)
 
     if args.from_stage <= 2:
         stage2_rows = run_stage2(stage1_rows)
